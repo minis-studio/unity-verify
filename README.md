@@ -38,7 +38,7 @@ This pins the latest release in `Packages/manifest.json`, writes a small
    `Packages/manifest.json`):
 
    ```json
-   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.1.0"
+   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.2.0"
    ```
 
 2. Copy [`Tools~/project-shim`](Tools~/project-shim) to `<project>/unity-verify`
@@ -55,10 +55,7 @@ Paste into `AGENTS.md` (or `CLAUDE.md`; a `CLAUDE.md` that only contains
 ```markdown
 ## Unity verification
 
-- Validate every change, including script-only changes, by running `./unity-verify` from the repository root with no arguments. It compiles the project and runs the full EditMode suite, reusing the open Unity Editor (leaving Play Mode first) or starting a headless one.
-- Do not preflight the Unity CLI/MCP or run Unity test commands directly; use only the wrapper.
-- Exit codes: `0` pass, `1` failed or inconclusive tests, `2` compile errors, `3` tooling/environment error, `130` interrupted. On `3`, keep your changes and report the `ERR` line verbatim; if the Unity CLI is missing, ask the user to install or repair it, then rerun.
-- PlayMode tests are not run. Add EditMode tests for changed behavior and list PlayMode-only behavior as unverified.
+Verify every change by running `./unity-verify` with no arguments. It compiles the project and runs all EditMode tests, whether or not the Editor is open; don't check the Unity CLI/MCP first or run tests any other way. PlayMode tests aren't run: cover changed behavior with EditMode tests and list PlayMode-only behavior as unverified.
 ```
 <!-- agents-snippet:end -->
 
@@ -92,15 +89,10 @@ The tool lives in the package, in `Tools~/` (Unity ignores `~` folders, so no
 manifest pins, and `packages-lock.json` records the exact commit.
 
 The committed `./unity-verify` shim only finds that copy and runs it with
-`--project-path` set to the project. It looks, in order, at:
-
-1. `$UNITY_VERIFY_PACKAGE`, if set (for developing the tool);
-2. `Packages/dev.minis.unity-verify/` (embedded package or git submodule);
-3. a `file:` dependency in `Packages/manifest.json`;
-4. `Library/PackageCache/dev.minis.unity-verify@*/`;
-5. the main checkout's `Library/PackageCache`, when run from a git worktree;
-6. a shallow clone of the locked commit in `~/.cache/unity-verify/`, for fresh
-   clones Unity has not opened yet.
+`--project-path` set to the project. It runs the copy Unity resolved into
+`Library/PackageCache/dev.minis.unity-verify@*/`. Until Unity has opened the
+checkout (right after install, a fresh clone or a new git worktree), it runs a
+shallow clone of the pinned tag in `~/.cache/unity-verify/` instead.
 
 ## Updating
 
@@ -114,11 +106,8 @@ the installer refreshes it either way.
 ## Developing
 
 ```bash
-# Point one project at your checkout without touching its manifest:
-UNITY_VERIFY_PACKAGE=path/to/unity-verify ./unity-verify
-
-# Or pin the checkout in a project with a file: dependency:
-python3 path/to/unity-verify/Tools~/install --local --project-path path/to/project
+# Run your checkout's tool against a project:
+path/to/unity-verify/Tools~/unity-verify --project-path path/to/project
 
 # Tests (no Unity needed):
 python3 -m unittest discover -s 'Tools~/tests'

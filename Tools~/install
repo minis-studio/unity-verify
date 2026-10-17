@@ -40,11 +40,6 @@ def parse_args() -> argparse.Namespace:
         help="git tag, branch or commit to pin (default: the latest release)",
     )
     parser.add_argument(
-        "--local",
-        action="store_true",
-        help="pin this checkout with a file: dependency instead of the git URL",
-    )
-    parser.add_argument(
         "--project-path",
         metavar="PATH",
         default=".",
@@ -107,19 +102,11 @@ def main() -> int:
         return EXIT_FAILURE
 
     checkout = package_checkout()
-    if args.local and checkout is None:
-        print("ERR local_unavailable; fix=run install from a package checkout", file=sys.stderr)
-        return EXIT_FAILURE
-
     try:
-        if args.local:
-            spec = f"file:{checkout}"
-            ref = ""
-        else:
-            ref = args.version or (
-                "v" + json.loads(package_file(checkout, "main", "package.json"))["version"]
-            )
-            spec = f"{GIT_URL}#{ref}"
+        ref = args.version or (
+            "v" + json.loads(package_file(checkout, "main", "package.json"))["version"]
+        )
+        spec = f"{GIT_URL}#{ref}"
         shim = package_file(checkout, ref, "Tools~/project-shim")
         snippet = package_file(checkout, ref, "Tools~/agents-snippet.md")
     except (OSError, ValueError, KeyError) as error:

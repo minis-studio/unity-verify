@@ -73,7 +73,6 @@ class TempDirTestCase(unittest.TestCase):
         self.temp = Path(tempfile.mkdtemp(prefix="unity-verify-test-")).resolve()
         self.addCleanup(shutil.rmtree, self.temp, ignore_errors=True)
         self.environment = {**os.environ, "XDG_CACHE_HOME": str(self.temp / "cache")}
-        self.environment.pop("UNITY_VERIFY_PACKAGE", None)
 
     def run_shim(self, shim: Path, *arguments: str, **environment: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -95,72 +94,26 @@ class ShimTests(TempDirTestCase):
         package = make_stub_package(project / "Library" / "PackageCache" / f"{PACKAGE}@4ee62b097584")
         self.assert_ran(self.run_shim(install_shim(project), "Board"), package, project)
 
-    def test_prefers_embedded_package_over_cache(self) -> None:
-        project = make_project(self.temp / "game", "https://example.invalid/x.git#v1")
-        make_stub_package(project / "Library" / "PackageCache" / f"{PACKAGE}@4ee62b097584")
-        embedded = make_stub_package(project / "Packages" / PACKAGE)
-        self.assert_ran(self.run_shim(install_shim(project), "Board"), embedded, project)
-
-    def test_resolves_file_dependency_relative_to_packages(self) -> None:
-        package = make_stub_package(self.temp / "checkout")
-        project = make_project(self.temp / "game", "file:../../checkout")
-        self.assert_ran(self.run_shim(install_shim(project), "Board"), package, project)
-
-    def test_environment_override_wins(self) -> None:
-        project = make_project(self.temp / "game", "file:../../checkout")
-        make_stub_package(self.temp / "checkout")
-        override = make_stub_package(self.temp / "dev")
-        completed = self.run_shim(install_shim(project), "Board", UNITY_VERIFY_PACKAGE=str(override))
-        self.assert_ran(completed, override, project)
-
-    def test_missing_override_is_reported_not_skipped(self) -> None:
-        project = make_project(self.temp / "game", "file:../../checkout")
-        make_stub_package(self.temp / "checkout")
-        completed = self.run_shim(install_shim(project), UNITY_VERIFY_PACKAGE=str(self.temp / "nope"))
-        self.assertEqual(completed.returncode, 3)
-        self.assertIn("ERR package_missing", completed.stderr)
-        self.assertIn("UNITY_VERIFY_PACKAGE", completed.stderr)
-
     def test_missing_dependency_is_reported(self) -> None:
         completed = self.run_shim(install_shim(make_project(self.temp / "game")))
         self.assertEqual(completed.returncode, 3)
         self.assertIn("ERR package_missing", completed.stderr)
 
-    def test_worktree_borrows_main_checkout_cache(self) -> None:
-        repository = self.temp / "repo"
-        project = make_project(repository / "client", "https://example.invalid/x.git#v1")
-        (project / "Assets" / "keep").write_text("")
-        install_shim(project)
-        git("init", cwd=repository)
-        git("add", "-A", cwd=repository)
-        git("commit", "-m", "init", cwd=repository)
-        package = make_stub_package(project / "Library" / "PackageCache" / f"{PACKAGE}@4ee62b097584")
-        git("worktree", "add", str(self.temp / "worktree"), cwd=repository)
-        worktree_project = self.temp / "worktree" / "client"
-        completed = self.run_shim(worktree_project / "unity-verify", "Board")
-        self.assert_ran(completed, package, worktree_project)
-
-    def test_fetches_locked_commit_when_nothing_is_resolved(self) -> None:
+    def test_fetches_pinned_tag_when_nothing_is_resolved(self) -> None:
         source = make_stub_package(self.temp / "source")
         # The real .gitignore, which must keep Tools~ despite global "*~" ignores.
         shutil.copy(PACKAGE_ROOT / ".gitignore", source / ".gitignore")
         git("init", cwd=source)
         git("add", "-A", cwd=source)
         git("commit", "-m", "v1", cwd=source)
-        locked = git("rev-parse", "HEAD", cwd=source)
         git("tag", "v1", cwd=source)
         (source / "Tools~" / "unity-verify").write_text(STUB_TOOL.replace("7", "8"))
         git("commit", "-am", "after v1", cwd=source)
-        git("tag", "-f", "v1", cwd=source)  # the tag moved since the lock was written
 
-        spec = f"git+file://{source}#v1"
-        project = make_project(self.temp / "game", spec)
-        (project / "Packages" / "packages-lock.json").write_text(
-            json.dumps({"dependencies": {PACKAGE: {"version": spec, "source": "git", "hash": locked}}})
-        )
+        project = make_project(self.temp / "game", f"file://{source}#v1")
         completed = self.run_shim(install_shim(project), "Board")
-        cached = self.temp / "cache" / "unity-verify" / locked
-        self.assert_ran(completed, cached, project)  # exit 7: the locked commit, not the moved tag
+        cached = self.temp / "cache" / "unity-verify" / "v1"
+        self.assert_ran(completed, cached, project)  # exit 7: the tag, not the branch tip
 
         shutil.rmtree(source)  # a second run must not need the network
         self.assert_ran(self.run_shim(project / "unity-verify", "Board"), cached, project)
@@ -224,32 +177,35 @@ class InstallerTests(TempDirTestCase):
                     indent=indent,
                 ) + "\n"
                 manifest.write_text(original)
-                self.assertEqual(self.run_install(project, "--local").returncode, 0)
+                self.assertEqual(self.run_install(project).returncode, 0)
                 # Ignore trailing commas: appending after the last entry adds one to it.
                 before = {line.rstrip(",") for line in original.splitlines()}
                 added = [line for line in manifest.read_text().splitlines() if line.rstrip(",") not in before]
                 self.assertEqual(len(added), 1, added)
-                self.assertTrue(added[0].startswith(" " * indent * 2 + f'"{PACKAGE}": "file:'))
+                self.assertTrue(added[0].startswith(" " * indent * 2 + f'"{PACKAGE}": "https://'))
 
     def test_is_idempotent(self) -> None:
         project = make_project(self.temp / "game")
-        self.assertEqual(self.run_install(project, "--local").returncode, 0)
+        self.assertEqual(self.run_install(project).returncode, 0)
         before = (project / "Packages" / "manifest.json").read_text()
-        self.assertEqual(self.run_install(project, "--local").returncode, 0)
+        self.assertEqual(self.run_install(project).returncode, 0)
         self.assertEqual((project / "Packages" / "manifest.json").read_text(), before)
 
     def test_refuses_to_replace_a_real_script_without_force(self) -> None:
         project = make_project(self.temp / "game")
         (project / "unity-verify").write_text("#!/usr/bin/env python3\n# not a shim\n")
-        completed = self.run_install(project, "--local")
+        completed = self.run_install(project)
         self.assertEqual(completed.returncode, 3)
         self.assertIn("ERR shim_exists", completed.stderr)
         self.assertNotIn(PACKAGE, (project / "Packages" / "manifest.json").read_text())
-        self.assertEqual(self.run_install(project, "--local", "--force").returncode, 0)
+        self.assertEqual(self.run_install(project, "--force").returncode, 0)
 
-    def test_local_install_runs_this_checkout(self) -> None:
+    def test_installed_shim_runs_resolved_package(self) -> None:
         project = make_project(self.temp / "game")
-        self.assertEqual(self.run_install(project, "--local").returncode, 0)
+        self.assertEqual(self.run_install(project).returncode, 0)
+        resolved = project / "Library" / "PackageCache" / f"{PACKAGE}@4ee62b097584" / "Tools~"
+        resolved.mkdir(parents=True)
+        shutil.copy(TOOLS / "unity-verify", resolved)
         completed = self.run_shim(project / "unity-verify", "--nope")
         self.assertEqual(completed.returncode, 3)
         self.assertIn("ERR args", completed.stderr)  # reached the real tool through the shim

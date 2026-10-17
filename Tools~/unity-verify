@@ -1120,7 +1120,7 @@ def main() -> int:
     executable = shutil.which(UNITY_EXECUTABLE)
     if not executable or not Path(executable).is_file():
         print(
-            f"ERR cli_missing; exe={UNITY_EXECUTABLE}; fix=install CLI, add PATH",
+            f"ERR cli_missing; exe={UNITY_EXECUTABLE}; fix=ask user to install CLI or add it to PATH",
             file=sys.stderr,
         )
         return EXIT_ENVIRONMENT_FAILURE
