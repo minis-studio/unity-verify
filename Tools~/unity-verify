@@ -22,6 +22,7 @@ from typing import Any
 # Set in main() from --project-path or the working directory; the script lives
 # in a Unity package, not in the project it verifies.
 PROJECT_ROOT = Path.cwd()
+RUNNER_PATH = Path(__file__).resolve().parent / "UnityVerifyRunner.cs"
 UNITY_EXECUTABLE = "unity"
 REQUIRED_UNITY_CLI_VERSION = "1.0.0-beta.8"
 UNITY_TIMEOUT_SECONDS = 330
@@ -81,116 +82,6 @@ class CompileResult:
     status: str
     diagnostics: tuple[CompileDiagnostic, ...] = ()
     detail: str = ""
-
-
-@dataclass(frozen=True)
-class EditModeResult:
-    """What the play-mode preflight established, or why it could not.
-
-    status is "stopped" (the Editor is in edit mode), "playing" (the Editor
-    reported an active play mode, named in detail), "unavailable" (no warm
-    Editor answered), or "error".
-    """
-
-    status: str
-    detail: str = ""
-
-
-WARM_COMPILE_PROBE = r'''
-var binding = System.Reflection.BindingFlags.Public |
-    System.Reflection.BindingFlags.NonPublic |
-    System.Reflection.BindingFlags.Instance |
-    System.Reflection.BindingFlags.Static;
-var editorAssembly = typeof(UnityEditor.Editor).Assembly;
-var interfaceType = editorAssembly.GetType(
-    "UnityEditor.Scripting.ScriptCompilation.EditorCompilationInterface", true);
-var interfaceProperty = interfaceType.GetProperty("Instance", binding);
-if (interfaceProperty == null) throw new System.Exception(
-    "EditorCompilationInterface.Instance is unavailable");
-var compilation = interfaceProperty.GetValue(null);
-var compilationType = compilation.GetType();
-var getMessages = compilationType.GetMethod("GetCompileMessages", binding);
-var pendingMethod = compilationType.GetMethod("IsScriptCompilationRequested", binding);
-var setupProperty = compilationType.GetProperty("CompilationSetupErrorsTracker", binding);
-var loadingProperty = compilationType.GetProperty("loadingAssemblyDefinition", binding);
-if (getMessages == null || pendingMethod == null || setupProperty == null ||
-    loadingProperty == null) throw new System.Exception(
-    "Unity compiler diagnostics API is unavailable");
-
-var diagnostics = new System.Collections.Generic.List<object>();
-foreach (var message in (System.Collections.IEnumerable)getMessages.Invoke(compilation, null)) {
-    var messageType = message.GetType();
-    var severity = messageType.GetField("type", binding).GetValue(message).ToString();
-    if (severity != "Error") continue;
-    diagnostics.Add(new {
-        message = (string)messageType.GetField("message", binding).GetValue(message),
-        file = (string)messageType.GetField("file", binding).GetValue(message),
-        line = (int)messageType.GetField("line", binding).GetValue(message),
-        column = (int)messageType.GetField("column", binding).GetValue(message)
-    });
-}
-
-var setupTracker = setupProperty.GetValue(compilation);
-var hasSetupErrors = (bool)setupTracker.GetType()
-    .GetMethod("HaveCompilationSetupErrors", binding).Invoke(setupTracker, null);
-if (hasSetupErrors) {
-    var loading = loadingProperty.GetValue(compilation);
-    var exceptionsProperty = loading.GetType().GetProperty("Exceptions", binding);
-    if (exceptionsProperty != null) {
-        var exceptions = exceptionsProperty.GetValue(loading) as System.Collections.IEnumerable;
-        if (exceptions != null) foreach (System.Exception exception in exceptions)
-            diagnostics.Add(new { message = exception.Message, file = "", line = 0, column = 0 });
-    }
-}
-
-var logEntries = editorAssembly.GetType("UnityEditor.LogEntries", true);
-var logEntry = editorAssembly.GetType("UnityEditor.LogEntry", true);
-var flagsProperty = logEntries.GetProperty("consoleFlags", binding);
-var getFilter = logEntries.GetMethod("GetFilteringText", binding);
-var setFilter = logEntries.GetMethod("SetFilteringText", binding);
-var startEntries = logEntries.GetMethod("StartGettingEntries", binding);
-var endEntries = logEntries.GetMethod("EndGettingEntries", binding);
-var getEntry = logEntries.GetMethod("GetEntryInternal", binding);
-if (flagsProperty == null || getFilter == null || setFilter == null ||
-    startEntries == null || endEntries == null || getEntry == null)
-    throw new System.Exception("Unity native Console diagnostics API is unavailable");
-var originalFlags = (int)flagsProperty.GetValue(null);
-var originalFilter = (string)getFilter.Invoke(null, null);
-try {
-    flagsProperty.SetValue(null, (originalFlags & ~1) | (1 << 7) | (1 << 8) | (1 << 9));
-    setFilter.Invoke(null, new object[] { "" });
-    var count = (int)startEntries.Invoke(null, null);
-    try {
-        for (var index = 0; index < count; index++) {
-            var entry = System.Activator.CreateInstance(logEntry);
-            if (!(bool)getEntry.Invoke(null, new object[] { index, entry }))
-                throw new System.Exception("Could not read Unity Console entry " + index);
-            var mode = (int)logEntry.GetField("mode", binding).GetValue(entry);
-            if ((mode & (1 << 11)) == 0) continue;
-            diagnostics.Add(new {
-                message = (string)logEntry.GetField("message", binding).GetValue(entry),
-                file = (string)logEntry.GetField("file", binding).GetValue(entry),
-                line = (int)logEntry.GetField("line", binding).GetValue(entry),
-                column = (int)logEntry.GetField("column", binding).GetValue(entry)
-            });
-        }
-    } finally {
-        endEntries.Invoke(null, null);
-    }
-} finally {
-    setFilter.Invoke(null, new object[] { originalFilter });
-    flagsProperty.SetValue(null, originalFlags);
-}
-
-return new {
-    failed = UnityEditor.EditorUtility.scriptCompilationFailed,
-    setupErrors = hasSetupErrors,
-    compiling = UnityEditor.EditorApplication.isCompiling,
-    updating = UnityEditor.EditorApplication.isUpdating,
-    pending = (bool)pendingMethod.Invoke(compilation, null),
-    diagnostics = diagnostics
-};
-'''
 
 
 def parse_args() -> argparse.Namespace:
@@ -438,112 +329,69 @@ def command_result(envelope: dict[str, Any]) -> Any:
     return data["result"]
 
 
-def recompile_status(envelope: dict[str, Any]) -> dict[str, Any]:
-    result = command_result(envelope)
-    if isinstance(result, str):
-        result = json.loads(result)
-    if not isinstance(result, dict) or not isinstance(result.get("status"), str):
-        raise ValueError("Unity returned an invalid recompile status")
-    return result
-
-
-def read_play_mode(executable: str, environment: dict[str, str]) -> EditModeResult:
-    """Read the Editor's play mode as the Editor itself reports it."""
-    try:
-        completed = run_process(
-            warm_command(executable, "editor_status"), environment, 25
-        )
-    except subprocess.TimeoutExpired:
-        return EditModeResult(
-            "error", "Unity CLI timed out reading editor status after 25s"
-        )
-    except OSError as error:
-        return EditModeResult("error", f"Could not run Unity CLI: {error}")
-
-    try:
-        envelope = cli_envelope(completed)
-    except (json.JSONDecodeError, ValueError) as error:
-        return EditModeResult(
-            "error", f"Unity CLI returned an invalid response: {error}"
-        )
-
-    if not envelope.get("success"):
-        detail = "\n".join(error_messages(envelope))
-        if warm_editor_unavailable(envelope):
-            return EditModeResult("unavailable", detail)
-        return EditModeResult("error", detail or "Unity editor_status command failed")
-
-    try:
-        result = command_result(envelope)
-    except ValueError as error:
-        return EditModeResult("error", str(error))
-    if not isinstance(result, dict) or not isinstance(result.get("playMode"), str):
-        return EditModeResult("error", "Unity returned an invalid editor status")
-    play_mode = result["playMode"]
-    return EditModeResult("stopped" if play_mode == "stopped" else "playing", play_mode)
-
-
-def stop_play_mode(
-    executable: str, environment: dict[str, str]
-) -> EditModeResult | None:
-    """Ask the Editor to exit play mode; return a failure, or None when accepted."""
+def stop_play_mode(executable: str, environment: dict[str, str]) -> str | None:
+    """Ask the Editor to exit play mode; return why it failed, or None when accepted."""
     try:
         completed = run_process(
             warm_command(executable, "editor_stop"), environment, 25
         )
     except subprocess.TimeoutExpired:
-        return EditModeResult("error", "Unity CLI timed out exiting play mode after 25s")
+        return "Unity CLI timed out exiting play mode after 25s"
     except OSError as error:
-        return EditModeResult("error", f"Could not run Unity CLI: {error}")
+        return f"Could not run Unity CLI: {error}"
 
     try:
         envelope = cli_envelope(completed)
     except (json.JSONDecodeError, ValueError) as error:
-        return EditModeResult(
-            "error", f"Unity CLI returned an invalid response: {error}"
-        )
+        return f"Unity CLI returned an invalid response: {error}"
 
     if envelope.get("success"):
         return None
-    detail = "\n".join(error_messages(envelope))
-    return EditModeResult("error", detail or "Unity editor_stop command failed")
+    return "\n".join(error_messages(envelope)) or "Unity editor_stop command failed"
 
 
-def edit_mode_preflight(executable: str, environment: dict[str, str]) -> EditModeResult:
-    """Settle the Editor into edit mode before compiling and running tests.
+def run_runner(
+    executable: str, environment: dict[str, str], test_filter: str
+) -> dict[str, Any]:
+    """Run UnityVerifyRunner.cs in the open Editor and return the CLI envelope.
 
-    Script compilation and the EditMode test run both assume an edit-mode
-    Editor, and neither the recompile nor the test command enforces it. The
-    play mode is read before stopping because editor_stop logs a warning when
-    it has nothing to stop. Returns "unavailable" when no warm Editor answered,
-    so the caller can fall back to the cold path, where a batch-mode Editor
-    never enters play mode.
+    run_script compiles the file in memory, so nothing is imported into the
+    project and no domain reload follows.
     """
-    state = read_play_mode(executable, environment)
-    if state.status != "playing":
-        return state
-
-    failure = stop_play_mode(executable, environment)
-    if failure is not None:
-        return failure
-
-    # The stop request lands on the next Editor tick, and leaving play mode can
-    # trigger a domain reload that briefly hides the pipeline server, so an
-    # unreadable status reply is retried rather than reported.
-    deadline = time.monotonic() + UNITY_TIMEOUT_SECONDS
-    reported = state.detail
-    while time.monotonic() < deadline:
-        time.sleep(WARM_POLL_SECONDS)
-        state = read_play_mode(executable, environment)
-        if state.status == "stopped":
-            return state
-        if state.status == "playing":
-            reported = state.detail
-    return EditModeResult(
-        "error",
-        f"Unity Editor reported {reported or 'play'} mode for "
-        f"{UNITY_TIMEOUT_SECONDS}s after editor_stop",
+    command = warm_command(
+        executable,
+        "run_script",
+        "--file",
+        str(RUNNER_PATH),
+        "--entry",
+        "UnityVerifyRunner.Run",
+        "--args",
+        json.dumps([test_filter]),
+        "--timeout_ms",
+        str(UNITY_TIMEOUT_SECONDS * 1000),
+        timeout=UNITY_TIMEOUT_SECONDS,
     )
+    return cli_envelope(run_process(command, environment, UNITY_TIMEOUT_SECONDS + 10))
+
+
+def runner_payload(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Return the runner's result, or raise ValueError with Unity's diagnostic."""
+    outer = command_result(envelope)
+    if not isinstance(outer, dict):
+        raise ValueError("Unity run_script returned an invalid result")
+    if not outer.get("success"):
+        details = [
+            line
+            for item in outer.get("diagnostics") or []
+            for line in compact_message(item.get("message") if isinstance(item, dict) else item)
+        ]
+        raise ValueError(
+            "\n".join(details) or str(outer.get("message") or "Unity run_script failed")
+        )
+    payload = outer.get("result")
+    if not isinstance(payload, dict) or not isinstance(payload.get("state"), str):
+        raise ValueError("Unity Verify runner returned an invalid result")
+    return payload
 
 
 def clean_path(path: Any) -> str:
@@ -712,87 +560,6 @@ def print_compile_result(result: CompileResult, stage: str) -> int:
     return EXIT_SUCCESS
 
 
-def warm_compile_preflight(
-    executable: str,
-    environment: dict[str, str],
-    initial_envelope: dict[str, Any],
-) -> CompileResult:
-    deadline = time.monotonic() + UNITY_TIMEOUT_SECONDS
-    try:
-        initial = command_result(initial_envelope)
-        state = initial.get("status") if isinstance(initial, dict) else None
-    except ValueError as error:
-        return CompileResult("error", detail=str(error))
-    if state not in {"compiling", "triggered", "up_to_date", "completed"}:
-        return CompileResult("error", detail="Unity returned an invalid initial recompile state")
-
-    status: dict[str, Any] = {"status": state, "failed": False, "errors": []}
-    while status["status"] in {"compiling", "triggered"}:
-        if time.monotonic() >= deadline:
-            return CompileResult("error", detail="Unity compilation timed out after 330s")
-        time.sleep(WARM_POLL_SECONDS)
-        try:
-            completed = run_process(
-                warm_command(executable, "recompile_status"), environment, 25
-            )
-            envelope = cli_envelope(completed)
-            if not envelope.get("success"):
-                continue
-            status = recompile_status(envelope)
-        except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired, ValueError):
-            # The server is temporarily unavailable during a successful domain reload.
-            continue
-
-    if status["status"] not in {"completed", "up_to_date"}:
-        return CompileResult("error", detail="Unity compilation did not reach a final state")
-
-    while time.monotonic() < deadline:
-        try:
-            completed = run_process(
-                warm_command(executable, "eval", "--code", WARM_COMPILE_PROBE),
-                environment,
-                25,
-            )
-            envelope = cli_envelope(completed)
-            outer = command_result(envelope)
-            if not isinstance(outer, dict) or not outer.get("success"):
-                detail = "; ".join(compact_message(outer.get("diagnostics"))) if isinstance(outer, dict) else ""
-                return CompileResult("error", detail=detail or "Warm compile probe failed")
-            payload = outer.get("result")
-            if not isinstance(payload, dict):
-                return CompileResult("error", detail="Warm compile probe returned an invalid result")
-            if payload.get("compiling") or payload.get("updating") or payload.get("pending"):
-                time.sleep(WARM_POLL_SECONDS)
-                continue
-
-            diagnostics = list(diagnostics_from_items(payload.get("diagnostics")))
-            for message in status.get("errors") or []:
-                diagnostic = diagnostic_from_values(message)
-                if diagnostic:
-                    diagnostics.append(diagnostic)
-            normalized = sorted_diagnostics(diagnostics)
-            failed = bool(payload.get("failed") or payload.get("setupErrors") or status.get("failed"))
-            if failed and not normalized:
-                return CompileResult(
-                    "error",
-                    detail="Unity reports compilation errors but returned no diagnostics",
-                )
-            if normalized:
-                return CompileResult("failed", normalized)
-            return CompileResult("passed")
-        except subprocess.TimeoutExpired:
-            pass
-        except (json.JSONDecodeError, OSError, ValueError) as error:
-            # A reload can race the first probe even after recompile_status completes.
-            last_error = str(error)
-        time.sleep(WARM_POLL_SECONDS)
-
-    return CompileResult(
-        "error",
-        detail=locals().get("last_error", "Unity compile probe timed out after 330s"),
-    )
-
-
 def cold_compile_preflight(
     executable: str,
     environment: dict[str, str],
@@ -899,21 +666,16 @@ def parse_nunit_results(results_path: Path) -> dict[str, Any]:
         )
 
     return {
-        "success": True,
-        "data": {
-            "result": {
-                "Summary": {
-                    "Total": count("total"),
-                    "Passed": count("passed"),
-                    "Failed": count("failed"),
-                    "Skipped": count("skipped"),
-                    "Inconclusive": count("inconclusive"),
-                },
-                "Results": results,
-                "Duration": duration,
-                "Mode": mode,
-            }
+        "Summary": {
+            "Total": count("total"),
+            "Passed": count("passed"),
+            "Failed": count("failed"),
+            "Skipped": count("skipped"),
+            "Inconclusive": count("inconclusive"),
         },
+        "Results": results,
+        "Duration": duration,
+        "Mode": mode,
     }
 
 
@@ -931,12 +693,11 @@ def canonical_test_name(result: dict[str, Any]) -> str:
 
 
 def filter_results_by_name(
-    envelope: dict[str, Any], requested_filter: str
+    result: dict[str, Any], requested_filter: str
 ) -> dict[str, Any]:
-    if not envelope.get("success") or not requested_filter:
-        return envelope
+    if not requested_filter:
+        return result
 
-    result = ((envelope.get("data") or {}).get("result") or {})
     results = result.get("Results") or []
     folded_filter = requested_filter.casefold()
     matched = [
@@ -958,21 +719,10 @@ def filter_results_by_name(
 
     result["Results"] = matched
     result["Summary"] = {"Total": len(matched), **counts}
-    return envelope
+    return result
 
 
-def print_report(
-    envelope: dict[str, Any], requested_filter: str, stage: str
-) -> int:
-    if not envelope.get("success"):
-        detail = "\n".join(error_messages(envelope))
-        print(
-            f"ERR unity_command; stage={stage}; cause={error_cause(detail)}; "
-            "fix=check CLI/Editor"
-        )
-        return EXIT_ENVIRONMENT_FAILURE
-
-    result = ((envelope.get("data") or {}).get("result") or {})
+def print_report(result: dict[str, Any], requested_filter: str) -> int:
     summary = result.get("Summary") or {}
     results = result.get("Results") or []
 
@@ -1014,15 +764,111 @@ def print_report(
         for location in compact_locations(failure.get("StackTrace")):
             print(f"  at {location}")
 
+    frame_tests = int(result.get("FrameTests") or 0)
+    if frame_tests:
+        print(
+            f"NOTE frame_tests; count={frame_tests}; "
+            f"duration={float(result.get('FrameDuration') or 0.0):.2f}s; "
+            "hint=use [Test], not [UnityTest]/[UnitySetUp]/[UnityTearDown]"
+        )
+
     return EXIT_SUCCESS if status == "PASS" else EXIT_TEST_FAILURE
 
 
-def print_warm_recompile_error(detail: str) -> int:
-    print(
-        f"ERR warm_recompile; cause={error_cause(detail)}; "
-        "fix=check CLI/Editor, retry"
-    )
-    return EXIT_ENVIRONMENT_FAILURE
+def warm_verification(
+    executable: str, environment: dict[str, str], test_filter: str
+) -> int | None:
+    """Compile and test in the open Editor through UnityVerifyRunner.cs.
+
+    Returns None when no warm Editor answers, so the caller can use the cold
+    path. The runner answers "playing" or "busy" until the Editor is in edit
+    mode and done compiling, importing and reloading; play mode is stopped
+    once, then the runner is called again until UNITY_TIMEOUT_SECONDS. Once
+    the Editor has answered, failed calls are retried as well, since a domain
+    reload drops the connection.
+    """
+    deadline = time.monotonic() + UNITY_TIMEOUT_SECONDS
+    answered = False
+    stop_sent = False
+    state = ""
+    while True:
+        try:
+            envelope: dict[str, Any] | None = run_runner(executable, environment, test_filter)
+        except subprocess.TimeoutExpired:
+            print(
+                f"ERR tests_timeout; path=warm; limit={UNITY_TIMEOUT_SECONDS + 10}s; "
+                "fix=check Editor/log"
+            )
+            return EXIT_ENVIRONMENT_FAILURE
+        except OSError as error:
+            print(
+                f"ERR tests_start; path=warm; cause={error_cause(str(error))}; "
+                "fix=check CLI/PATH"
+            )
+            return EXIT_ENVIRONMENT_FAILURE
+        except (json.JSONDecodeError, ValueError):
+            envelope = None
+
+        if envelope is not None and envelope.get("success"):
+            answered = True
+            try:
+                payload = runner_payload(envelope)
+            except ValueError as error:
+                print(f"ERR runner; cause={error_cause(str(error))}; fix=check CLI/Editor")
+                return EXIT_ENVIRONMENT_FAILURE
+            state = payload["state"]
+            if state == "tests":
+                return print_report(payload, test_filter)
+            if state == "compile_failed":
+                diagnostics = diagnostics_from_items(payload.get("diagnostics"))
+                return print_compile_result(
+                    CompileResult("failed", diagnostics)
+                    if diagnostics
+                    else CompileResult(
+                        "error",
+                        detail="Unity reports compilation errors but returned no diagnostics",
+                    ),
+                    "warm",
+                )
+            if state == "playing" and not stop_sent:
+                failure = stop_play_mode(executable, environment)
+                if failure is not None:
+                    print(
+                        f"ERR edit_mode; cause={error_cause(failure)}; "
+                        "fix=check CLI/Editor, exit play mode"
+                    )
+                    return EXIT_ENVIRONMENT_FAILURE
+                stop_sent = True
+            elif state not in {"playing", "busy"}:
+                print(f"ERR runner; cause=unknown state {state}; fix=update unity-verify")
+                return EXIT_ENVIRONMENT_FAILURE
+        elif not answered:
+            if envelope is None:
+                print("ERR cli_response; stage=warm; cause=invalid_json; fix=retry/update CLI")
+                return EXIT_ENVIRONMENT_FAILURE
+            if warm_editor_unavailable(envelope):
+                return None
+            detail = "\n".join(error_messages(envelope))
+            print(
+                f"ERR unity_command; stage=warm; cause={error_cause(detail)}; "
+                "fix=check CLI/Editor"
+            )
+            return EXIT_ENVIRONMENT_FAILURE
+
+        if time.monotonic() >= deadline:
+            if state == "playing":
+                print(
+                    f"ERR edit_mode; cause=Unity Editor stayed in play mode for "
+                    f"{UNITY_TIMEOUT_SECONDS}s after editor_stop; "
+                    "fix=check CLI/Editor, exit play mode"
+                )
+            else:
+                print(
+                    f"ERR compile_timeout; path=warm; limit={UNITY_TIMEOUT_SECONDS}s; "
+                    "fix=check reload/Editor"
+                )
+            return EXIT_ENVIRONMENT_FAILURE
+        time.sleep(WARM_POLL_SECONDS)
 
 
 def cold_verification(
@@ -1088,7 +934,7 @@ def cold_verification(
             return EXIT_ENVIRONMENT_FAILURE
 
         try:
-            cold_envelope = parse_nunit_results(results_path)
+            cold_result = parse_nunit_results(results_path)
         except (ET.ParseError, OSError, ValueError) as error:
             print(
                 f"ERR test_results_invalid; cause={error_cause(str(error))}; "
@@ -1096,11 +942,7 @@ def cold_verification(
             )
             return EXIT_ENVIRONMENT_FAILURE
 
-        return print_report(
-            filter_results_by_name(cold_envelope, test_filter),
-            test_filter,
-            "cold",
-        )
+        return print_report(filter_results_by_name(cold_result, test_filter), test_filter)
 
 
 def main() -> int:
@@ -1140,91 +982,9 @@ def main() -> int:
         )
         return EXIT_ENVIRONMENT_FAILURE
 
-    # Compilation and the EditMode run both need edit mode, so settle the
-    # Editor before anything compiles.
-    edit_mode = edit_mode_preflight(str(executable), environment)
-    if edit_mode.status == "error":
-        print(
-            f"ERR edit_mode; cause={error_cause(edit_mode.detail)}; "
-            "fix=check CLI/Editor, exit play mode"
-        )
-        return EXIT_ENVIRONMENT_FAILURE
-    if edit_mode.status == "unavailable":
-        return cold_verification(str(executable), environment, args.filter)
-
-    try:
-        completed = run_process(
-            warm_command(str(executable), "recompile"),
-            environment,
-            25,
-        )
-    except subprocess.TimeoutExpired:
-        return print_warm_recompile_error(
-            "Unity CLI timed out starting compile preflight after 25s"
-        )
-    except OSError as error:
-        return print_warm_recompile_error(f"Could not run Unity CLI: {error}")
-
-    try:
-        envelope = cli_envelope(completed)
-    except (json.JSONDecodeError, ValueError) as error:
-        print("ERR cli_response; stage=recompile; cause=invalid_json; fix=retry/update CLI")
-        return EXIT_ENVIRONMENT_FAILURE
-
-    use_cold_path = not envelope.get("success") and warm_editor_unavailable(envelope)
-    if not use_cold_path:
-        if not envelope.get("success"):
-            detail = "\n".join(error_messages(envelope))
-            return print_warm_recompile_error(
-                detail or "Unity recompile command failed without a diagnostic"
-            )
-        compile_result = warm_compile_preflight(
-            str(executable), environment, envelope
-        )
-        compile_exit = print_compile_result(compile_result, "warm")
-        if compile_exit:
-            return compile_exit
-
-        test_command = warm_command(
-            str(executable),
-            "run_tests",
-            "--mode",
-            "editor",
-            "--filter",
-            args.filter,
-            "--filter_type",
-            "testName",
-            "--include_explicit",
-            "false",
-            "--async_tests",
-            "false",
-            timeout=UNITY_TIMEOUT_SECONDS,
-        )
-        try:
-            completed = run_process(
-                test_command, environment, UNITY_TIMEOUT_SECONDS + 10
-            )
-        except subprocess.TimeoutExpired:
-            print(
-                f"ERR tests_timeout; path=warm; limit={UNITY_TIMEOUT_SECONDS + 10}s; "
-                "fix=check Editor/log"
-            )
-            return EXIT_ENVIRONMENT_FAILURE
-        except OSError as error:
-            print(
-                f"ERR tests_start; path=warm; cause={error_cause(str(error))}; "
-                "fix=check CLI/PATH"
-            )
-            return EXIT_ENVIRONMENT_FAILURE
-        try:
-            test_envelope = cli_envelope(completed)
-        except (json.JSONDecodeError, ValueError) as error:
-            print("ERR cli_response; stage=tests; cause=invalid_json; fix=retry/update CLI")
-            return EXIT_ENVIRONMENT_FAILURE
-        return print_report(
-            filter_results_by_name(test_envelope, args.filter), args.filter, "warm"
-        )
-
+    warm_exit = warm_verification(str(executable), environment, args.filter)
+    if warm_exit is not None:
+        return warm_exit
     return cold_verification(str(executable), environment, args.filter)
 
 

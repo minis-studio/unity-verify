@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0]
+
+- In the open Editor, one `run_script` call of `Tools~/UnityVerifyRunner.cs`
+  refreshes assets, reports compile errors and runs the tests. It replaces the
+  separate `editor_status`, `recompile`, `recompile_status`, `eval` and
+  `run_tests` calls, and play mode is still stopped first.
+- Tests run with the Test Framework's `runSynchronously`, inside one Editor
+  update instead of several per test. `EditorApplication.update` and
+  `delayCall` callbacks no longer run between tests.
+- Tests that need frames (`[UnityTest]`, `[UnitySetUp]`, `[UnityTearDown]`)
+  run in a second, normal pass, and the report adds a `NOTE frame_tests` line
+  with its cost.
+- Full runs no longer list the tests first unless a second pass may be needed.
+
 ## [0.2.0]
 
 - The `./unity-verify` shim only supports the GitHub git dependency: it runs

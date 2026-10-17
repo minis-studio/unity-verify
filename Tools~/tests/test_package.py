@@ -1,4 +1,4 @@
-"""Tests for the packaging layer: project discovery, the shim and the installer.
+"""Tests for the packaging layer and the tool's warm path, without Unity.
 
 Run from the package root: python3 -m unittest discover -s 'Tools~/tests'
 """
@@ -29,6 +29,36 @@ STUB_TOOL = textwrap.dedent(
     import json, sys
     print(json.dumps({"tool": __file__, "argv": sys.argv[1:]}))
     raise SystemExit(7)
+    """
+)
+
+# Stands in for the Unity CLI: answers run_script with the next reply in
+# $FAKE_UNITY_REPLIES (a JSON list, consumed in order) and logs each command.
+FAKE_UNITY = textwrap.dedent(
+    """\
+    #!/usr/bin/env python3
+    import json, os, sys
+    args = sys.argv[1:]
+    if args == ["--version"]:
+        print("1.0.0-beta.12")
+        raise SystemExit(0)
+    name = args[args.index("command") + 5] if "command" in args else args[5]
+    with open(os.environ["FAKE_UNITY_LOG"], "a") as log:
+        log.write(name + "\\n")
+    if name == "run_script":
+        path = os.environ["FAKE_UNITY_REPLIES"]
+        replies = json.load(open(path))
+        reply = replies.pop(0)
+        json.dump(replies, open(path, "w"))
+        if "error" in reply:
+            print(json.dumps({"success": False, "errors": [{"message": reply["error"]}]}))
+            raise SystemExit(1)
+        print(json.dumps({"success": True, "data": {"result": {"success": True, "result": reply}}}))
+    elif name == "editor_stop":
+        print(json.dumps({"success": True, "data": {"result": "Exited play mode"}}))
+    else:
+        print(json.dumps({"success": False, "errors": [{"message": "no Editor"}]}))
+        raise SystemExit(1)
     """
 )
 
@@ -145,6 +175,88 @@ class ToolTests(TempDirTestCase):
         completed = self.run_tool("--nope", cwd=make_project(self.temp / "game"))
         self.assertEqual(completed.returncode, 3)
         self.assertIn("ERR args", completed.stderr)
+
+
+def tests_reply(failed: int = 0, frame_tests: int = 0) -> dict:
+    return {
+        "state": "tests",
+        "Summary": {"Total": 2, "Passed": 2 - failed, "Failed": failed, "Skipped": 0, "Inconclusive": 0},
+        "Results": [
+            {
+                "FullName": "BoardTests.Fails",
+                "Status": "Failed",
+                "Message": "Expected: 1\n  But was:  2",
+                "StackTrace": "at BoardTests.Fails () [0x0] in /p/Assets/Tests/BoardTests.cs:12",
+            }
+        ][:failed],
+        "Duration": 0.5,
+        "Mode": "EditMode",
+        "FrameTests": frame_tests,
+        "FrameDuration": 4.0 if frame_tests else 0,
+    }
+
+
+class WarmPathTests(TempDirTestCase):
+    def run_warm(self, *replies: dict) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        bin_directory = self.temp / "bin"
+        bin_directory.mkdir()
+        (bin_directory / "unity").write_text(FAKE_UNITY)
+        (bin_directory / "unity").chmod(0o755)
+        (self.temp / "replies.json").write_text(json.dumps(list(replies)))
+        completed = subprocess.run(
+            [sys.executable, str(TOOLS / "unity-verify"), "--project-path", str(make_project(self.temp / "game"))],
+            env={
+                **self.environment,
+                "PATH": f"{bin_directory}{os.pathsep}{os.environ['PATH']}",
+                "FAKE_UNITY_REPLIES": str(self.temp / "replies.json"),
+                "FAKE_UNITY_LOG": str(self.temp / "calls.log"),
+            },
+            capture_output=True, text=True, timeout=60,
+        )
+        return completed, (self.temp / "calls.log").read_text().split()
+
+    def test_waits_through_compile_and_reload_then_reports_failures(self) -> None:
+        completed, calls = self.run_warm(
+            {"state": "busy"}, {"error": "Network error: connection reset"}, tests_reply(failed=1)
+        )
+        self.assertEqual(completed.returncode, 1, completed.stdout)
+        self.assertEqual(calls, ["run_script"] * 3)
+        lines = completed.stdout.splitlines()
+        self.assertTrue(lines[0].startswith("FAIL tests; total=2 passed=1 failed=1 "), lines)
+        self.assertEqual(lines[1:], [
+            "[1] BoardTests.Fails", "  Expected: 1", "  But was:  2", "  at /p/Assets/Tests/BoardTests.cs:12",
+        ])
+
+    def test_stops_play_mode_once_and_notes_frame_tests(self) -> None:
+        completed, calls = self.run_warm(
+            {"state": "playing"}, {"state": "playing"}, tests_reply(frame_tests=1)
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        self.assertEqual(calls, ["run_script", "editor_stop", "run_script", "run_script"])
+        self.assertTrue(completed.stdout.startswith("PASS tests; total=2 passed=2 failed=0 "))
+        self.assertIn("NOTE frame_tests; count=1; duration=4.00s;", completed.stdout)
+
+    def test_reports_compile_errors(self) -> None:
+        completed, _ = self.run_warm({
+            "state": "compile_failed",
+            "diagnostics": [{"message": "Assets/A.cs(3,5): error CS1002: ; expected", "file": "", "line": 0, "column": 0}],
+        })
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout.splitlines(), [
+            "ERR compile_failed; errors=1; tests=skipped", "Assets/A.cs:3:5 error CS1002: ; expected",
+        ])
+
+    def test_reports_a_failing_first_call_without_retrying(self) -> None:
+        completed, calls = self.run_warm({"error": "run_script is disabled"})
+        self.assertEqual(completed.returncode, 3)
+        self.assertEqual(calls, ["run_script"])
+        self.assertIn("ERR unity_command; stage=warm; cause=run_script is disabled;", completed.stdout)
+
+    def test_falls_back_to_a_headless_editor_without_a_warm_one(self) -> None:
+        completed, calls = self.run_warm({"error": "No Pipeline instance found for project"})
+        self.assertEqual(calls, ["run_script", "run"])
+        self.assertEqual(completed.returncode, 3)
+        self.assertIn("ERR compile_log_missing", completed.stdout)
 
 
 class InstallerTests(TempDirTestCase):
