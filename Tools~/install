@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Add dev.minis.unity-verify to a Unity project.
+
+Run from the project root, either from a checkout of the package:
+
+    python3 path/to/unity-verify/Tools~/install
+
+or straight from GitHub:
+
+    curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | python3 -
+
+It pins the package in Packages/manifest.json, writes the ./unity-verify shim
+and prints the AGENTS.md snippet. Re-run it with --version to upgrade.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+PACKAGE = "dev.minis.unity-verify"
+GIT_URL = "https://github.com/minis-studio/unity-verify.git"
+RAW_URL = "https://raw.githubusercontent.com/minis-studio/unity-verify"
+SHIM_NAME = "unity-verify"
+SHIM_MARKER = "# unity-verify shim."
+EXIT_FAILURE = 3
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="install", description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--version",
+        metavar="REF",
+        help="git tag, branch or commit to pin (default: the latest release)",
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="pin this checkout with a file: dependency instead of the git URL",
+    )
+    parser.add_argument(
+        "--project-path",
+        metavar="PATH",
+        default=".",
+        help="Unity project root (default: the current directory)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=f"replace an existing ./{SHIM_NAME} that is not a shim",
+    )
+    return parser.parse_args()
+
+
+def package_checkout() -> Path | None:
+    """Return the package folder this installer runs from, or None when piped."""
+    script = Path(globals().get("__file__") or "<stdin>")
+    if not script.is_file():
+        return None
+    package = script.resolve().parent.parent
+    return package if (package / "Tools~" / "project-shim").is_file() else None
+
+
+def fetch_text(ref: str, path: str) -> str:
+    with urllib.request.urlopen(f"{RAW_URL}/{ref}/{path}", timeout=30) as response:
+        return response.read().decode()
+
+
+def package_file(checkout: Path | None, ref: str, path: str) -> str:
+    if checkout is not None:
+        return (checkout / path).read_text()
+    return fetch_text(ref, path)
+
+
+def json_indent(text: str) -> int:
+    match = re.search(r'^( +)"', text, re.MULTILINE)
+    return len(match.group(1)) if match else 2
+
+
+def with_dependency(manifest: dict[str, Any], spec: str) -> dict[str, Any]:
+    """Return manifest with the package pinned, keeping existing key order."""
+    dependencies = manifest.get("dependencies") or {}
+    if PACKAGE in dependencies:
+        updated = {key: (spec if key == PACKAGE else value) for key, value in dependencies.items()}
+    else:
+        updated = {}
+        for key, value in dependencies.items():
+            if PACKAGE not in updated and key > PACKAGE:
+                updated[PACKAGE] = spec
+            updated[key] = value
+        updated.setdefault(PACKAGE, spec)
+    return {**manifest, "dependencies": updated}
+
+
+def main() -> int:
+    args = parse_args()
+    root = Path(args.project_path).expanduser().resolve()
+    manifest_path = root / "Packages" / "manifest.json"
+    if not manifest_path.is_file() or not (root / "ProjectSettings" / "ProjectVersion.txt").is_file():
+        print(f"ERR project_missing; path={root}; fix=run from a Unity project root", file=sys.stderr)
+        return EXIT_FAILURE
+
+    checkout = package_checkout()
+    if args.local and checkout is None:
+        print("ERR local_unavailable; fix=run install from a package checkout", file=sys.stderr)
+        return EXIT_FAILURE
+
+    try:
+        if args.local:
+            spec = f"file:{checkout}"
+            ref = ""
+        else:
+            ref = args.version or (
+                "v" + json.loads(package_file(checkout, "main", "package.json"))["version"]
+            )
+            spec = f"{GIT_URL}#{ref}"
+        shim = package_file(checkout, ref, "Tools~/project-shim")
+        snippet = package_file(checkout, ref, "Tools~/agents-snippet.md")
+    except (OSError, ValueError, KeyError) as error:
+        print(f"ERR package_fetch; cause={error}; fix=check network or --version", file=sys.stderr)
+        return EXIT_FAILURE
+
+    shim_path = root / SHIM_NAME
+    if shim_path.exists() and not args.force and SHIM_MARKER not in shim_path.read_text(errors="replace"):
+        print(
+            f"ERR shim_exists; path={shim_path}; "
+            "fix=rerun with --force to replace it (it is not a unity-verify shim)",
+            file=sys.stderr,
+        )
+        return EXIT_FAILURE
+
+    manifest_text = manifest_path.read_text()
+    manifest = json.loads(manifest_text)
+    previous = (manifest.get("dependencies") or {}).get(PACKAGE)
+    if previous != spec:
+        updated = json.dumps(
+            with_dependency(manifest, spec), indent=json_indent(manifest_text), ensure_ascii=False
+        )
+        manifest_path.write_text(updated + "\n")
+    shim_path.write_text(shim)
+    shim_path.chmod(0o755)
+
+    print(f"{PACKAGE}: {previous or 'not installed'} -> {spec}")
+    print(f"wrote ./{SHIM_NAME}")
+    print()
+    print("Next: focus the Unity Editor (or just run ./unity-verify), then commit")
+    print(f"  Packages/manifest.json Packages/packages-lock.json {SHIM_NAME}")
+    print()
+    print("Add this to AGENTS.md / CLAUDE.md:")
+    print()
+    print(snippet.rstrip())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

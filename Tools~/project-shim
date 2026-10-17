@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+# unity-verify shim. Installed by dev.minis.unity-verify; commit it, don't edit it.
+"""Find the dev.minis.unity-verify package for this project and run its tool.
+
+The tool itself lives in the package's Tools~ folder, so the version a project
+runs is the version its Packages/manifest.json pins. This file only locates it.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+PACKAGE = "dev.minis.unity-verify"
+TOOL = "unity-verify"
+PROJECT_ROOT = Path(__file__).resolve().parent
+EXIT_ENVIRONMENT_FAILURE = 3
+GIT_TIMEOUT_SECONDS = 120
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def dependency_spec() -> tuple[str, str]:
+    """Return the manifest's spec for the package and its locked commit, if any."""
+    packages = PROJECT_ROOT / "Packages"
+    declared = (read_json(packages / "manifest.json").get("dependencies") or {}).get(PACKAGE)
+    locked = (read_json(packages / "packages-lock.json").get("dependencies") or {}).get(PACKAGE)
+    locked = locked if isinstance(locked, dict) else {}
+    spec = str(declared or locked.get("version") or "")
+    # A stale lock describes an older spec; only trust its commit when they agree.
+    commit = str(locked.get("hash") or "") if locked.get("version") == spec else ""
+    return spec, commit
+
+
+def newest_first(paths: list[Path]) -> list[Path]:
+    def modified(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return sorted(paths, key=modified, reverse=True)
+
+
+def main_worktree_project() -> Path | None:
+    """Return this project's path in the main checkout when run from a git worktree."""
+    try:
+        lines = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if len(lines) != 2 or Path(lines[1]).name != ".git":
+        return None
+    toplevel = Path(lines[0]).resolve()
+    main_root = Path(lines[1]).resolve().parent
+    if main_root == toplevel:
+        return None
+    try:
+        return main_root / PROJECT_ROOT.relative_to(toplevel)
+    except ValueError:
+        return None
+
+
+def local_candidates() -> list[Path]:
+    """Return package folders that need no network, most authoritative first."""
+    packages = PROJECT_ROOT / "Packages"
+    candidates = [packages / PACKAGE]  # embedded package or git submodule
+    spec, _ = dependency_spec()
+    if spec.startswith("file:"):
+        candidates.append(packages / spec[len("file:") :])
+    candidates.extend(
+        newest_first(list((PROJECT_ROOT / "Library" / "PackageCache").glob(f"{PACKAGE}@*")))
+    )
+    # A fresh git worktree has no Library yet; borrow the main checkout's copy.
+    main_project = main_worktree_project()
+    if main_project is not None:
+        candidates.extend(
+            newest_first(list((main_project / "Library" / "PackageCache").glob(f"{PACKAGE}@*")))
+        )
+    return candidates
+
+
+def git(*arguments: str, cwd: Path | None = None) -> str:
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=GIT_TIMEOUT_SECONDS,
+        check=True,
+    ).stdout.strip()
+
+
+def fetch_package() -> Path | None:
+    """Fetch the pinned git revision into a user cache, for unresolved checkouts."""
+    spec, commit = dependency_spec()
+    location, _, revision = spec.partition("#")
+    url, _, query = location.removeprefix("git+").partition("?")
+    if "://" not in url and not url.startswith("git@"):
+        return None
+    subpath = next(
+        (value.strip("/") for key, _, value in (part.partition("=") for part in query.split("&")) if key == "path"),
+        "",
+    )
+    is_sha = bool(re.fullmatch(r"[0-9a-fA-F]{40}", revision))
+    commit = commit or (revision if is_sha else "")
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / TOOL
+    target = cache_root / (commit or re.sub(r"[^A-Za-z0-9._-]", "_", revision or "HEAD"))
+    if (target / subpath / "Tools~" / TOOL).is_file():
+        return target / subpath
+
+    print(f"unity-verify: fetching {spec} into {cache_root}", file=sys.stderr)
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=cache_root) as staging:
+            checkout = Path(staging) / "checkout"
+            branch = ["--branch", revision] if revision and not is_sha else []
+            git("clone", "--quiet", "--depth", "1", *branch, url, str(checkout))
+            if commit and git("rev-parse", "HEAD", cwd=checkout) != commit:
+                git("fetch", "--quiet", "--depth", "1", "origin", commit, cwd=checkout)
+                git("checkout", "--quiet", "FETCH_HEAD", cwd=checkout)
+            if not target.exists():
+                checkout.rename(target)
+    except (OSError, subprocess.SubprocessError) as error:
+        stderr = getattr(error, "stderr", "") or str(error)
+        cause = (stderr.strip().splitlines() or ["unknown"])[-1].replace(";", ",")[:160]
+        print(
+            f"ERR package_fetch; pkg={PACKAGE}; cause={cause}; "
+            "fix=check network/git access, or open the project in Unity once",
+            file=sys.stderr,
+        )
+        raise SystemExit(EXIT_ENVIRONMENT_FAILURE)
+    return target / subpath
+
+
+def main() -> int:
+    override = os.environ.get("UNITY_VERIFY_PACKAGE")
+    if override:
+        candidates = [Path(override).expanduser()]
+    else:
+        candidates = local_candidates()
+    package = next((path for path in candidates if (path / "Tools~" / TOOL).is_file()), None)
+    if package is None and not override:
+        package = fetch_package()
+    if package is None:
+        where = "UNITY_VERIFY_PACKAGE" if override else "Packages/manifest.json"
+        print(
+            f"ERR package_missing; pkg={PACKAGE}; checked={where}; "
+            "fix=add the package to Packages/manifest.json, open Unity once",
+            file=sys.stderr,
+        )
+        return EXIT_ENVIRONMENT_FAILURE
+
+    tool = package.resolve() / "Tools~" / TOOL
+    os.execv(
+        sys.executable,
+        [sys.executable, str(tool), "--project-path", str(PROJECT_ROOT), *sys.argv[1:]],
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

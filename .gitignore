@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+
+# Unity ignores folders ending in ~, and so do many global gitignores (*~).
+# Re-include the tool folder so it is never silently left out of a commit.
+!/Tools~/

@@ -1,0 +1,21 @@
+{
+  "name": "dev.minis.unity-verify",
+  "displayName": "Unity Verify",
+  "version": "0.1.0",
+  "unity": "6000.0",
+  "description": "Agent-friendly compile and EditMode test verification. Ships the unity-verify command-line tool, which reuses the open Editor through Unity Pipeline or falls back to a headless run, and prints a compact report with stable exit codes.",
+  "keywords": [
+    "testing",
+    "verification",
+    "cli",
+    "agents",
+    "ai"
+  ],
+  "dependencies": {
+    "com.unity.pipeline": "0.6.0-exp.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/minis-studio/unity-verify.git"
+  }
+}
