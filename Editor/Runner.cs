@@ -85,6 +85,10 @@ namespace UnityVerify
             }
             if (!EditorApplication.isPlayingOrWillChangePlaymode && !EditorApplication.isCompiling)
             {
+                if (PackageChanges.Pending())
+                {
+                    return new Outcome { State = Outcome.Busy };
+                }
                 AssetDatabase.Refresh();
             }
             if (IsBusy())

@@ -1,7 +1,7 @@
 {
   "name": "dev.minis.unity-verify",
   "displayName": "Unity Verify",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "unity": "6000.0",
   "description": "Agent-friendly compile and EditMode test verification. Ships the unity-verify command-line tool, which runs the tests in the open Editor or in a batch-mode one, and prints a compact report with stable exit codes.",
   "keywords": [

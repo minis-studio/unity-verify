@@ -40,7 +40,7 @@ This pins the latest release in `Packages/manifest.json`, writes a small
    `Packages/manifest.json`):
 
    ```json
-   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.6.0"
+   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.6.1"
    ```
 
 2. Copy [`Tools~/project-shim`](Tools~/project-shim) to `<project>/unity-verify`
@@ -152,9 +152,11 @@ The package has two parts:
 - `Editor/` is a small Editor-only assembly (`UnityVerify.Editor`) that compiles
   into the project. It runs the tests, applies the time limits and writes the
   report. In the open Editor it answers requests that `unity-verify` leaves in
-  `Library/UnityVerify/`, on Editor updates: it leaves Play Mode first, waits
-  while the Editor compiles, imports or reloads, and keeps the Editor ticking
-  while a request is in progress. In a batch-mode Editor,
+  `Library/UnityVerify/`, on Editor updates: it leaves Play Mode first, has the
+  Package Manager resolve when `Packages/manifest.json` or `packages-lock.json`
+  changed (a background Editor otherwise keeps its packages until it gets
+  focus), waits while the Editor compiles, imports or reloads, and keeps the
+  Editor ticking while a request is in progress. In a batch-mode Editor,
   `UnityVerify.Batch.Run` answers one request and exits.
 - `Tools~/` holds bash scripts, which Unity ignores (`~` folders get no `.meta`
   files or compilation). `unity-verify` hands a request to the Editor that has
@@ -173,7 +175,7 @@ shallow clone of the pinned tag in `~/.cache/unity-verify/` instead.
 ## Updating
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash -s -- --version v0.6.0
+curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash -s -- --version v0.6.1
 ```
 
 or change the `#v…` suffix in `Packages/manifest.json`. The shim rarely changes;

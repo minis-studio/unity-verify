@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1]
+
+- In the open Editor, a run first has the Package Manager resolve when
+  `Packages/manifest.json` or `packages-lock.json` changed since it last read
+  them, as Unity does when the Editor gets focus. A background Editor
+  otherwise ran the tests with the packages it had.
+
 ## [0.6.0]
 
 - Tests that wait for frames (`[UnityTest]`, `[UnitySetUp]`, `[UnityTearDown]`)
