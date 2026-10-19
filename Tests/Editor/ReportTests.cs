@@ -91,14 +91,30 @@ namespace UnityVerify
         }
 
         [Test]
-        public void FrameTestsAreNoted()
+        public void FrameTestsAreNamedAsNotRun()
         {
             var outcome = Tests(Test("BoardTests.A"));
-            outcome.FrameTests = 1;
-            outcome.FrameDuration = 4;
+            outcome.FrameTests.Add("BoardTests.WaitsAFrame");
             var text = Report.Format(outcome, "", "warm", Root);
-            Assert.That(Lines(text)[1], Is.EqualTo(
-                "NOTE frame_tests; count=1; duration=4.00s; hint=use [Test], not [UnityTest]/[UnitySetUp]/[UnityTearDown]"));
+            Assert.That(text.Code, Is.EqualTo(Report.Success));
+            Assert.That(Lines(text), Is.EqualTo(new[]
+            {
+                "PASS tests; total=1 passed=1 failed=0 frame_skipped=1 duration=0.50s mode=EditMode",
+                "WARN frame_tests_skipped; count=1; hint=[UnityTest], [UnitySetUp] and [UnityTearDown] tests " +
+                "don't run; write [Test]s that call Editor-update code directly",
+                "  BoardTests.WaitsAFrame",
+            }));
+        }
+
+        [Test]
+        public void FilterMatchingOnlyFrameTestsNamesThem()
+        {
+            var outcome = Tests();
+            outcome.FrameTests.Add("BoardTests.WaitsAFrame");
+            var text = Report.Format(outcome, "Waits", "warm", Root);
+            Assert.That(text.Code, Is.EqualTo(Report.EnvironmentFailure));
+            Assert.That(Lines(text)[0], Is.EqualTo("ERR tests_none; filter=Waits; mode=EditMode; fix=check filter/tests"));
+            Assert.That(Lines(text)[2], Is.EqualTo("  BoardTests.WaitsAFrame"));
         }
 
         [Test]

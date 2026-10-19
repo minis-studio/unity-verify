@@ -184,8 +184,12 @@ namespace UnityVerify
 
             if (total == 0)
             {
-                return Error($"tests_none; filter={(string.IsNullOrEmpty(filter) ? "none" : filter)}; " +
+                var none = Error($"tests_none; filter={(string.IsNullOrEmpty(filter) ? "none" : filter)}; " +
                     "mode=EditMode; fix=check filter/tests");
+                var notRun = new List<string> { none.Body };
+                AddFrameTests(outcome, notRun);
+                none.Body = string.Join("\n", notRun);
+                return none;
             }
 
             // Slowest first. Passed tests over the limit count as failures.
@@ -208,6 +212,10 @@ namespace UnityVerify
             if (inconclusive > 0)
             {
                 fields.Add($"inconclusive={inconclusive}");
+            }
+            if (outcome.FrameTests.Count > 0)
+            {
+                fields.Add($"frame_skipped={outcome.FrameTests.Count}");
             }
             fields.Add("duration=" + outcome.Duration.ToString("0.00", CultureInfo.InvariantCulture) + "s");
             fields.Add("mode=EditMode");
@@ -238,14 +246,22 @@ namespace UnityVerify
                 lines.AddRange(slow.Select(result => $"  {FormatSeconds(result.Duration)} {Name(result)}"));
             }
 
-            if (outcome.FrameTests > 0)
-            {
-                lines.Add($"NOTE frame_tests; count={outcome.FrameTests}; " +
-                    "duration=" + outcome.FrameDuration.ToString("0.00", CultureInfo.InvariantCulture) + "s; " +
-                    "hint=use [Test], not [UnityTest]/[UnitySetUp]/[UnityTearDown]");
-            }
-
+            AddFrameTests(outcome, lines);
             return new Text { Code = pass ? Success : TestFailure, Body = string.Join("\n", lines) };
+        }
+
+        // Tests that wait for frames don't run; name them, so what they cover counts
+        // as unverified.
+        static void AddFrameTests(Outcome outcome, List<string> lines)
+        {
+            if (outcome.FrameTests.Count == 0)
+            {
+                return;
+            }
+            lines.Add($"WARN frame_tests_skipped; count={outcome.FrameTests.Count}; " +
+                "hint=[UnityTest], [UnitySetUp] and [UnityTearDown] tests don't run; " +
+                "write [Test]s that call Editor-update code directly");
+            lines.AddRange(outcome.FrameTests.Select(name => "  " + name));
         }
 
         static string Name(TestResult result)

@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.0]
+
+- Tests that wait for frames (`[UnityTest]`, `[UnitySetUp]`, `[UnityTearDown]`)
+  don't run, like PlayMode tests. The summary line counts them in
+  `frame_skipped=N`, a `WARN frame_tests_skipped` line names them, and they
+  don't change the exit code. The `NOTE frame_tests` line is gone.
+- The AGENTS.md snippet says which tests don't run and to list what they cover
+  as unverified.
+
 ## [0.5.0]
 
 - The package no longer depends on `com.unity.pipeline`, the Unity CLI or

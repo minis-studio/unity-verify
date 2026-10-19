@@ -23,8 +23,8 @@ namespace UnityVerify
         public readonly List<Diagnostic> Diagnostics = new List<Diagnostic>();
         public readonly List<TestResult> Results = new List<TestResult>();
         public double Duration;
-        public int FrameTests;
-        public double FrameDuration;
+        // Tests that wait for frames, which don't run.
+        public readonly List<string> FrameTests = new List<string>();
     }
 
     sealed class Diagnostic
@@ -52,7 +52,6 @@ namespace UnityVerify
         sealed class Collector : ICallbacks
         {
             public readonly List<ITestResultAdaptor> Results = new List<ITestResultAdaptor>();
-            public readonly TaskCompletionSource<bool> Finished = new TaskCompletionSource<bool>();
 
             public void RunStarted(ITestAdaptor testsToRun) { }
             public void TestStarted(ITestAdaptor test) { }
@@ -65,10 +64,7 @@ namespace UnityVerify
                 }
             }
 
-            public void RunFinished(ITestResultAdaptor result)
-            {
-                Finished.TrySetResult(true);
-            }
+            public void RunFinished(ITestResultAdaptor result) { }
         }
 
         /// <summary>
@@ -77,9 +73,9 @@ namespace UnityVerify
         /// "playing" and "busy" (compiling, importing or reloading) ask the caller to
         /// settle the Editor and run again. Tests run with the Test Framework's
         /// runSynchronously, inside this one call, so they don't wait for Editor
-        /// updates. Tests that need frames ([UnityTest], [UnitySetUp],
-        /// [UnityTearDown]) are skipped by that mode and run afterwards in a normal
-        /// pass.
+        /// updates. Tests that wait for frames ([UnityTest], [UnitySetUp],
+        /// [UnityTearDown]) can't run that way, so they don't run; the outcome
+        /// names them.
         /// </summary>
         internal static async Task<Outcome> Run(string filter)
         {
@@ -109,7 +105,7 @@ namespace UnityVerify
             try
             {
                 // Listing waits for Editor updates, so a full run skips it unless
-                // a second pass may be needed.
+                // there may be frame tests to name.
                 var names = new List<string>();
                 var listed = !string.IsNullOrEmpty(filter) || MayNeedFrames();
                 if (listed)
@@ -139,32 +135,9 @@ namespace UnityVerify
                 }
 
                 var ran = new HashSet<string>(sync.Results.Select(result => result.Test.FullName));
-                var frameNames = names.Where(name => !ran.Contains(name)).ToArray();
-                var frames = new Collector();
-                var frameWatch = Stopwatch.StartNew();
-                if (frameNames.Length > 0)
-                {
-                    api.RegisterCallbacks(frames);
-                    try
-                    {
-                        api.Execute(new ExecutionSettings(
-                            new Filter { testMode = TestMode.EditMode, testNames = frameNames }));
-                        await frames.Finished.Task;
-                    }
-                    finally
-                    {
-                        api.UnregisterCallbacks(frames);
-                    }
-                }
-
-                var outcome = new Outcome
-                {
-                    State = Outcome.Tests,
-                    Duration = total.Elapsed.TotalSeconds,
-                    FrameTests = frames.Results.Count,
-                    FrameDuration = frameNames.Length > 0 ? frameWatch.Elapsed.TotalSeconds : 0,
-                };
-                outcome.Results.AddRange(sync.Results.Concat(frames.Results).Select(result => new TestResult
+                var outcome = new Outcome { State = Outcome.Tests, Duration = total.Elapsed.TotalSeconds };
+                outcome.FrameTests.AddRange(names.Where(name => !ran.Contains(name)));
+                outcome.Results.AddRange(sync.Results.Select(result => new TestResult
                 {
                     FullName = result.Test.FullName,
                     Status = result.TestStatus.ToString(),

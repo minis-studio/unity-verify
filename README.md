@@ -40,7 +40,7 @@ This pins the latest release in `Packages/manifest.json`, writes a small
    `Packages/manifest.json`):
 
    ```json
-   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.5.0"
+   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.6.0"
    ```
 
 2. Copy [`Tools~/project-shim`](Tools~/project-shim) to `<project>/unity-verify`
@@ -57,7 +57,7 @@ Paste into `AGENTS.md` (or `CLAUDE.md`; a `CLAUDE.md` that only contains
 ```markdown
 ## Unity verification
 
-Verify every change by running `./unity-verify` with no arguments. It compiles the project and runs all EditMode tests, whether or not the Editor is open; don't check the Unity CLI/MCP first or run tests any other way. PlayMode tests aren't run: cover changed behavior with EditMode tests and list PlayMode-only behavior as unverified. Tests run synchronously, so write `[Test]`s that call Editor-update code directly instead of `[UnityTest]`s that wait for frames. Keep every test under 50 ms: tests over 200 ms get a warning and tests over 1 s fail.
+Verify every change by running `./unity-verify` with no arguments. It compiles the project and runs all EditMode tests, whether or not the Editor is open; don't check the Unity CLI/MCP first or run tests any other way. PlayMode tests and tests that wait for frames (`[UnityTest]`, `[UnitySetUp]`, `[UnityTearDown]`) don't run: write `[Test]`s that call Editor-update code directly, and list behavior only those could cover as unverified. Keep every test under 50 ms: tests over 200 ms get a warning and tests over 1 s fail.
 ```
 <!-- agents-snippet:end -->
 
@@ -102,8 +102,7 @@ WARN slow_tests; count=1; over=200ms; hint=tests fail over 1s and are expected t
   340ms SnapshotTests.SavesScene
 ```
 
-A test's time includes its `[SetUp]` and `[TearDown]`. Frame tests in the open
-Editor (see below) also include the time spent waiting for Editor updates.
+A test's time includes its `[SetUp]` and `[TearDown]`.
 
 ## Fast tests
 
@@ -134,13 +133,16 @@ This changes what a test can rely on:
   }
   ```
 
-- Tests that need frames (`[UnityTest]`, or a fixture with `[UnitySetUp]` or
-  `[UnityTearDown]`) still run, in a second, normal pass after the synchronous
-  one. In the open Editor that pass costs a few seconds on its own, and the
-  report says so:
+- Tests that wait for frames (`[UnityTest]`, or a fixture with `[UnitySetUp]` or
+  `[UnityTearDown]`) don't run, like PlayMode tests: synchronous mode can't run
+  them, and a background Editor would spend seconds on even one. They don't
+  change the exit code; the summary counts them and the report names them, so
+  what they cover counts as unverified:
 
   ```text
-  NOTE frame_tests; count=1; duration=4.27s; hint=use [Test], not [UnityTest]/[UnitySetUp]/[UnityTearDown]
+  PASS tests; total=211 passed=211 failed=0 frame_skipped=1 duration=8.02s mode=EditMode
+  WARN frame_tests_skipped; count=1; hint=[UnityTest], [UnitySetUp] and [UnityTearDown] tests don't run; write [Test]s that call Editor-update code directly
+    MaterialTests.UpdatesOnTheNextFrame
   ```
 
 ## How it works
@@ -171,7 +173,7 @@ shallow clone of the pinned tag in `~/.cache/unity-verify/` instead.
 ## Updating
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash -s -- --version v0.5.0
+curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash -s -- --version v0.6.0
 ```
 
 or change the `#v…` suffix in `Packages/manifest.json`. The shim rarely changes;
