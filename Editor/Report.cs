@@ -192,10 +192,13 @@ namespace UnityVerify
                 return none;
             }
 
-            // Slowest first. Passed tests over the limit count as failures.
+            // Slowest first. Passed tests over their limit count as failures; a test
+            // with its own [MaxTime] gets no warning under it.
             var byTime = results.OrderByDescending(result => result.Duration).ToList();
-            var tooSlow = byTime.Where(result => result.Status == "Passed" && result.Duration > FailSeconds).ToList();
-            var slow = byTime.Where(result => result.Duration > WarnSeconds && result.Duration <= FailSeconds).ToList();
+            var tooSlow = byTime.Where(result => result.Status == "Passed" &&
+                result.Duration > (result.MaxTime ?? FailSeconds)).ToList();
+            var slow = byTime.Where(result => result.MaxTime == null &&
+                result.Duration > WarnSeconds && result.Duration <= FailSeconds).ToList();
             passed -= tooSlow.Count;
             failed += tooSlow.Count;
 
@@ -237,7 +240,10 @@ namespace UnityVerify
             foreach (var result in tooSlow)
             {
                 lines.Add($"[{++index}] {Name(result)}");
-                lines.Add($"  Took {FormatSeconds(result.Duration)}; {expectation}.");
+                var limit = result.MaxTime == null
+                    ? expectation
+                    : $"its [MaxTime] is {FormatSeconds(result.MaxTime.Value)}";
+                lines.Add($"  Took {FormatSeconds(result.Duration)}; {limit}.");
             }
 
             if (slow.Count > 0)

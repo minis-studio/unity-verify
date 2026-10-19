@@ -13,9 +13,9 @@ namespace UnityVerify
             return outcome;
         }
 
-        static TestResult Test(string name, string status = "Passed", double duration = 0.01)
+        static TestResult Test(string name, string status = "Passed", double duration = 0.01, double? maxTime = null)
         {
-            var result = new TestResult { FullName = name, Status = status, Duration = duration };
+            var result = new TestResult { FullName = name, Status = status, Duration = duration, MaxTime = maxTime };
             if (status == "Failed")
             {
                 result.Message = "Expected: 1\n  But was:  2\n";
@@ -78,6 +78,25 @@ namespace UnityVerify
                 $"WARN slow_tests; count=2; over=200ms; hint={expectation}",
                 "  1s BoardTests.Slower",
                 "  350ms BoardTests.Slow",
+            }));
+        }
+
+        [Test]
+        public void MaxTimeReplacesTheDefaultLimits()
+        {
+            var text = Report.Format(Tests(
+                Test("LevelTests.Within", duration: 0.5, maxTime: 1),
+                Test("LevelTests.WithinLong", duration: 2.5, maxTime: 3),
+                Test("LevelTests.Over", duration: 3.2, maxTime: 3),
+                Test("BoardTests.OverTight", duration: 0.03, maxTime: 0.02)), "", "warm", Root);
+            Assert.That(text.Code, Is.EqualTo(Report.TestFailure));
+            Assert.That(Lines(text), Is.EqualTo(new[]
+            {
+                "FAIL tests; total=4 passed=2 failed=2 too_slow=2 duration=0.50s mode=EditMode",
+                "[1] LevelTests.Over",
+                "  Took 3.2s; its [MaxTime] is 3s.",
+                "[2] BoardTests.OverTight",
+                "  Took 30ms; its [MaxTime] is 20ms.",
             }));
         }
 

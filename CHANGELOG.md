@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0]
+
+- A test with NUnit's `[MaxTime]` gets that limit instead of the default ones:
+  it isn't listed in `WARN slow_tests`, and over its limit it counts in
+  `too_slow` with `Took 3.2s; its [MaxTime] is 3s.`
+- The AGENTS.md snippet asks agents not to add or raise `[MaxTime]` unless
+  asked.
+
 ## [0.6.1]
 
 - In the open Editor, a run first has the Package Manager resolve when

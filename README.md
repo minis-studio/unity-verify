@@ -40,7 +40,7 @@ This pins the latest release in `Packages/manifest.json`, writes a small
    `Packages/manifest.json`):
 
    ```json
-   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.6.1"
+   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.7.0"
    ```
 
 2. Copy [`Tools~/project-shim`](Tools~/project-shim) to `<project>/unity-verify`
@@ -57,7 +57,7 @@ Paste into `AGENTS.md` (or `CLAUDE.md`; a `CLAUDE.md` that only contains
 ```markdown
 ## Unity verification
 
-Verify every change by running `./unity-verify` with no arguments. It compiles the project and runs all EditMode tests, whether or not the Editor is open; don't check the Unity CLI/MCP first or run tests any other way. PlayMode tests and tests that wait for frames (`[UnityTest]`, `[UnitySetUp]`, `[UnityTearDown]`) don't run: write `[Test]`s that call Editor-update code directly, and list behavior only those could cover as unverified. Keep every test under 50 ms: tests over 200 ms get a warning and tests over 1 s fail.
+Verify every change by running `./unity-verify` with no arguments. It compiles the project and runs all EditMode tests, whether or not the Editor is open; don't check the Unity CLI/MCP first or run tests any other way. PlayMode tests and tests that wait for frames (`[UnityTest]`, `[UnitySetUp]`, `[UnityTearDown]`) don't run: write `[Test]`s that call Editor-update code directly, and list behavior only those could cover as unverified. Keep every test under 50 ms: tests over 200 ms get a warning and tests over 1 s fail, unless the test has its own `[MaxTime]`; don't add or raise one unless asked.
 ```
 <!-- agents-snippet:end -->
 
@@ -103,6 +103,22 @@ WARN slow_tests; count=1; over=200ms; hint=tests fail over 1s and are expected t
 ```
 
 A test's time includes its `[SetUp]` and `[TearDown]`.
+
+A test can set its own limit with NUnit's `[MaxTime]`, in milliseconds. It then
+gets no warning and fails only over that limit, as it does in the Test Runner
+window:
+
+```csharp
+[Test, MaxTime(3000)]
+public void BuildsEveryLevel() { ... }
+```
+
+```text
+[1] LevelTests.BuildsEveryLevel
+  Took 3.2s; its [MaxTime] is 3s.
+```
+
+The agent snippet asks agents not to add or raise `[MaxTime]` unless asked.
 
 ## Fast tests
 
@@ -175,7 +191,7 @@ shallow clone of the pinned tag in `~/.cache/unity-verify/` instead.
 ## Updating
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash -s -- --version v0.6.1
+curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash -s -- --version v0.7.0
 ```
 
 or change the `#v…` suffix in `Packages/manifest.json`. The shim rarely changes;

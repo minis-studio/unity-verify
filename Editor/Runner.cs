@@ -42,6 +42,8 @@ namespace UnityVerify
         public double Duration;
         public string Message;
         public string StackTrace;
+        // Seconds from the test's own [MaxTime], which replaces the default limits.
+        public double? MaxTime;
     }
 
     static class Runner
@@ -141,19 +143,51 @@ namespace UnityVerify
                 var ran = new HashSet<string>(sync.Results.Select(result => result.Test.FullName));
                 var outcome = new Outcome { State = Outcome.Tests, Duration = total.Elapsed.TotalSeconds };
                 outcome.FrameTests.AddRange(names.Where(name => !ran.Contains(name)));
-                outcome.Results.AddRange(sync.Results.Select(result => new TestResult
-                {
-                    FullName = result.Test.FullName,
-                    Status = result.TestStatus.ToString(),
-                    Duration = result.Duration,
-                    Message = result.Message,
-                    StackTrace = result.StackTrace,
-                }));
+                outcome.Results.AddRange(sync.Results.Select(Result));
                 return outcome;
             }
             finally
             {
                 UnityEngine.Object.DestroyImmediate(api);
+            }
+        }
+
+        static TestResult Result(ITestResultAdaptor result)
+        {
+            var test = new TestResult
+            {
+                FullName = result.Test.FullName,
+                Status = result.TestStatus.ToString(),
+                Duration = result.Duration,
+                Message = result.Message,
+                StackTrace = result.StackTrace,
+            };
+            // Only a slow or failed test can depend on its [MaxTime], so fast tests
+            // skip the lookup.
+            if (test.Duration > Report.WarnSeconds || result.TestStatus == TestStatus.Failed)
+            {
+                ApplyMaxTime(test, result.Test.Method?.MethodInfo);
+            }
+            return test;
+        }
+
+        // A test's own [MaxTime] replaces the default time limits. NUnit fails a
+        // passing test that goes over it; that test counts as passed again, so the
+        // report lists it with the other tests that are too slow.
+        internal static void ApplyMaxTime(TestResult test, MethodInfo method)
+        {
+            var attribute = method?.GetCustomAttribute<NUnit.Framework.MaxTimeAttribute>();
+            if (attribute == null)
+            {
+                return;
+            }
+            test.MaxTime = Convert.ToDouble(attribute.Properties.Get(NUnit.Framework.Internal.PropertyNames.MaxTime)) / 1000;
+            if (test.Status == "Failed" && test.Duration > test.MaxTime &&
+                (test.Message ?? "").StartsWith("Elapsed time of ", StringComparison.Ordinal))
+            {
+                test.Status = "Passed";
+                test.Message = null;
+                test.StackTrace = null;
             }
         }
 
