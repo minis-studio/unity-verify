@@ -1,922 +1,359 @@
-#!/usr/bin/env python3
-"""Run Unity editor tests and print a compact verification report."""
-
-from __future__ import annotations
-
-import argparse
-from dataclasses import dataclass
-import fcntl
-import json
-import os
-import re
-import signal
-import shutil
-import subprocess
-import sys
-import tempfile
-import time
-from pathlib import Path
-from typing import Any
-
-
-# Set in main() from --project-path or the working directory; the script lives
-# in a Unity package, not in the project it verifies.
-PROJECT_ROOT = Path.cwd()
-RUNNER_PATH = Path(__file__).resolve().parent / "UnityVerifyRunner.cs"
-UNITY_EXECUTABLE = "unity"
-REQUIRED_UNITY_CLI_VERSION = "1.0.0-beta.12"
-# The com.unity.pipeline version that runs UnityVerifyRunner.cs; package.json
-# depends on the same one.
-REQUIRED_PIPELINE_VERSION = "0.6.0-exp.1"
-UNITY_TIMEOUT_SECONDS = 330
-# A headless run imports and compiles the project before testing it.
-COLD_TIMEOUT_SECONDS = 2 * UNITY_TIMEOUT_SECONDS
-ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
-CLI_VERSION = re.compile(r"\b(?:v)?(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b")
-SEMVER = re.compile(
-    r"(?P<major>0|[1-9]\d*)\."
-    r"(?P<minor>0|[1-9]\d*)\."
-    r"(?P<patch>0|[1-9]\d*)"
-    r"(?:-(?P<prerelease>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
-)
-SOURCE_LOCATION = re.compile(r"\bin\s+(.+?):(\d+)\s*$")
-COMPILER_DIAGNOSTIC = re.compile(
-    r"^(?P<file>.+?)\((?P<line>\d+),(?P<column>\d+)\):\s*"
-    r"error\s+(?P<code>[A-Za-z]+\d+):\s*(?P<message>.+)$"
-)
-PLAIN_COMPILER_ERROR = re.compile(
-    r"^error(?:\s+(?P<code>[A-Za-z]+\d+))?:\s*(?P<message>.+)$",
-    re.IGNORECASE,
-)
-ASSEMBLY_PATH = re.compile(r"(?P<file>(?:Assets|Packages)/.*?\.asm(?:def|ref))")
-ASSEMBLY_ERROR = re.compile(
-    r"(?:assembly (?:definition|reference|has|with name)|"
-    r"cyclic references?|duplicate references?|asmdef|asmref)",
-    re.IGNORECASE,
-)
-WARM_POLL_SECONDS = 0.5
-# Every test is expected to finish within TEST_EXPECTED_SECONDS. Run-to-run
-# variance is allowed up to 4x that before a warning; a test over
-# TEST_FAIL_SECONDS fails even when its assertions pass.
-TEST_EXPECTED_SECONDS = 0.05
-TEST_WARN_SECONDS = 0.2
-TEST_FAIL_SECONDS = 1.0
-
-EXIT_SUCCESS = 0
-EXIT_TEST_FAILURE = 1
-EXIT_COMPILATION_FAILURE = 2
-EXIT_ENVIRONMENT_FAILURE = 3
-EXIT_INTERRUPTED = 130
-
-
-class VerifyArgumentParser(argparse.ArgumentParser):
-    def error(self, message: str) -> None:
-        self.print_usage(sys.stderr)
-        self.exit(
-            EXIT_ENVIRONMENT_FAILURE,
-            f"ERR args; cause={error_cause(message)}; fix=run unity-verify [FILTER]\n",
-        )
-
-
-@dataclass(frozen=True)
-class CompileDiagnostic:
-    file: str = ""
-    line: int = 0
-    column: int = 0
-    code: str = ""
-    message: str = ""
-
-
-def parse_args() -> argparse.Namespace:
-    parser = VerifyArgumentParser(
-        prog="unity-verify",
-        add_help=False,
-        description=(
-            "Run editor tests, reusing the open Unity Editor when available. "
-            "Play mode is exited first, since compilation and the editor test "
-            "run both need edit mode. With no FILTER, runs all editor tests; "
-            "otherwise runs editor tests whose fixture or method names contain "
-            "FILTER."
-        ),
-    )
-    parser.add_argument(
-        "filter",
-        nargs="?",
-        default="",
-        metavar="FILTER",
-        help="case-insensitive partial test-name filter",
-    )
-    parser.add_argument(
-        "--project-path",
-        default="",
-        metavar="PATH",
-        help="Unity project root; defaults to the project containing the working directory",
-    )
-    return parser.parse_args()
-
-
-def find_project_root(start: Path) -> Path | None:
-    """Return the nearest Unity project at or above start."""
-    for candidate in (start, *start.parents):
-        if (candidate / "Assets").is_dir() and (
-            candidate / "ProjectSettings" / "ProjectVersion.txt"
-        ).is_file():
-            return candidate
-    return None
-
-
-def parse_json_output(output: str) -> dict[str, Any]:
-    clean = ANSI_ESCAPE.sub("", output).strip()
-    try:
-        value = json.loads(clean)
-    except json.JSONDecodeError:
-        # Be tolerant of an informational line emitted before the JSON envelope.
-        start = clean.find("{")
-        if start < 0:
-            raise
-        value, _ = json.JSONDecoder().raw_decode(clean[start:])
-    if not isinstance(value, dict):
-        raise ValueError("Unity CLI returned a non-object JSON value")
-    return value
-
-
-def compact_message(message: Any) -> list[str]:
-    if not message:
-        return []
-    lines = [line.strip() for line in str(message).splitlines() if line.strip()]
-    kept = [line[:300] + ("..." if len(line) > 300 else "") for line in lines[:12]]
-    if len(lines) > len(kept):
-        kept.append(f"... {len(lines) - len(kept)} more message lines")
-    return kept
-
-
-def compact_locations(stack_trace: Any) -> list[str]:
-    if not stack_trace:
-        return []
-
-    locations: list[str] = []
-    fallback: list[str] = []
-    root = str(PROJECT_ROOT) + os.sep
-
-    for raw_line in str(stack_trace).splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        fallback.append(line)
-        match = SOURCE_LOCATION.search(line)
-        if not match:
-            continue
-        path = match.group(1)
-        if path.startswith(root):
-            path = path[len(root) :]
-        location = f"{path}:{match.group(2)}"
-        if location not in locations:
-            locations.append(location)
-
-    if locations:
-        return locations[:3]
-    return fallback[:1]
-
-
-def error_messages(envelope: dict[str, Any]) -> list[str]:
-    messages: list[str] = []
-    for error in envelope.get("errors") or []:
-        if isinstance(error, dict):
-            message = error.get("message") or error.get("code")
-        else:
-            message = error
-        if message:
-            messages.extend(compact_message(message))
-    return messages
-
-
-def warm_editor_unavailable(envelope: dict[str, Any]) -> bool:
-    return any(
-        "No Pipeline instance found for project" in message
-        for message in error_messages(envelope)
-    )
-
-
-def terminate_process_group(process: subprocess.Popen[str]) -> None:
-    """Terminate a spawned Unity process group, escalating after a short wait."""
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
-
-
-def run_process(command: list[str], environment: dict[str, str], timeout: float) -> subprocess.CompletedProcess[str]:
-    """Run a CLI process and clean up its process group if the run is aborted."""
-    process = subprocess.Popen(
-        command,
-        cwd=PROJECT_ROOT,
-        env=environment,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        terminate_process_group(process)
-        raise
-    except KeyboardInterrupt:
-        terminate_process_group(process)
-        raise
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-
-
-def cli_envelope(completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
-    output = completed.stdout.strip() or completed.stderr.strip()
-    return parse_json_output(output)
-
-
-def cli_error_detail(completed: subprocess.CompletedProcess[str]) -> str:
-    """Return the most useful compact diagnostic captured from a CLI process."""
-    details: list[str] = []
-    try:
-        details.extend(error_messages(cli_envelope(completed)))
-    except (json.JSONDecodeError, ValueError):
-        pass
-    if not details:
-        details.extend(compact_message(completed.stderr or completed.stdout)[:5])
-    return "\n".join(details)
-
-
-def unity_cli_version(
-    executable: str, environment: dict[str, str]
-) -> str | None:
-    """Return the Unity CLI version reported by its executable."""
-    try:
-        completed = run_process([executable, "--version"], environment, 10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if completed.returncode != 0:
-        return None
-    match = CLI_VERSION.search(ANSI_ESCAPE.sub("", completed.stdout + completed.stderr))
-    return match.group("version") if match else None
-
-
-def version_is_at_least(installed: str, required: str) -> bool:
-    """Compare Semantic Versions, ignoring build metadata precedence."""
-    installed_match = SEMVER.fullmatch(installed)
-    required_match = SEMVER.fullmatch(required)
-    if not installed_match or not required_match:
-        return False
-
-    installed_core = tuple(
-        int(installed_match.group(part)) for part in ("major", "minor", "patch")
-    )
-    required_core = tuple(
-        int(required_match.group(part)) for part in ("major", "minor", "patch")
-    )
-    if installed_core != required_core:
-        return installed_core > required_core
-
-    installed_prerelease = installed_match.group("prerelease")
-    required_prerelease = required_match.group("prerelease")
-    if installed_prerelease is None:
-        return True
-    if required_prerelease is None:
-        return False
-
-    for installed_part, required_part in zip(
-        installed_prerelease.split("."), required_prerelease.split(".")
-    ):
-        if installed_part == required_part:
-            continue
-        installed_numeric = installed_part.isdecimal()
-        required_numeric = required_part.isdecimal()
-        if installed_numeric and required_numeric:
-            return int(installed_part) > int(required_part)
-        if installed_numeric != required_numeric:
-            return not installed_numeric
-        return installed_part > required_part
-
-    return len(installed_prerelease.split(".")) >= len(required_prerelease.split("."))
-
-
-def warm_command(executable: str, command: str, *arguments: str, timeout: int = 20) -> list[str]:
-    return [
-        executable,
-        "--no-banner",
-        "--no-pager",
-        "--non-interactive",
-        "--format",
-        "json",
-        "command",
-        "--project-path",
-        str(PROJECT_ROOT),
-        "--timeout",
-        str(timeout),
-        command,
-        *arguments,
-    ]
-
-
-def command_result(envelope: dict[str, Any]) -> Any:
-    if not envelope.get("success"):
-        raise ValueError("Unity command was unsuccessful")
-    data = envelope.get("data")
-    if not isinstance(data, dict) or data.get("success") is False or "result" not in data:
-        raise ValueError("Unity command returned an incomplete result")
-    return data["result"]
-
-
-def stop_play_mode(executable: str, environment: dict[str, str]) -> str | None:
-    """Ask the Editor to exit play mode; return why it failed, or None when accepted."""
-    try:
-        completed = run_process(
-            warm_command(executable, "editor_stop"), environment, 25
-        )
-    except subprocess.TimeoutExpired:
-        return "Unity CLI timed out exiting play mode after 25s"
-    except OSError as error:
-        return f"Could not run Unity CLI: {error}"
-
-    try:
-        envelope = cli_envelope(completed)
-    except (json.JSONDecodeError, ValueError) as error:
-        return f"Unity CLI returned an invalid response: {error}"
-
-    if envelope.get("success"):
-        return None
-    return "\n".join(error_messages(envelope)) or "Unity editor_stop command failed"
-
-
-def runner_arguments(test_filter: str) -> list[str]:
-    """Arguments of the run_script command that runs UnityVerifyRunner.cs.
-
-    run_script compiles the file in memory, so nothing is imported into the
-    project and no domain reload follows.
-    """
-    return [
-        "--file",
-        str(RUNNER_PATH),
-        "--entry",
-        "UnityVerifyRunner.Run",
-        "--args",
-        json.dumps([test_filter]),
-        "--timeout_ms",
-        str(UNITY_TIMEOUT_SECONDS * 1000),
-    ]
-
-
-def run_runner(
-    executable: str, environment: dict[str, str], test_filter: str
-) -> dict[str, Any]:
-    """Run UnityVerifyRunner.cs in the open Editor and return the CLI envelope."""
-    command = warm_command(
-        executable,
-        "run_script",
-        *runner_arguments(test_filter),
-        timeout=UNITY_TIMEOUT_SECONDS,
-    )
-    return cli_envelope(run_process(command, environment, UNITY_TIMEOUT_SECONDS + 10))
-
-
-def runner_payload(envelope: dict[str, Any]) -> dict[str, Any]:
-    """Return the runner's result, or raise ValueError with Unity's diagnostic."""
-    outer = command_result(envelope)
-    if not isinstance(outer, dict):
-        raise ValueError("Unity run_script returned an invalid result")
-    if not outer.get("success"):
-        details = [
-            line
-            for item in outer.get("diagnostics") or []
-            for line in compact_message(item.get("message") if isinstance(item, dict) else item)
-        ]
-        raise ValueError(
-            "\n".join(details) or str(outer.get("message") or "Unity run_script failed")
-        )
-    payload = outer.get("result")
-    if not isinstance(payload, dict) or not isinstance(payload.get("state"), str):
-        raise ValueError("Unity Verify runner returned an invalid result")
-    return payload
-
-
-def clean_path(path: Any) -> str:
-    value = str(path or "").strip().replace("\\", "/")
-    root = str(PROJECT_ROOT).replace("\\", "/").rstrip("/")
-    if value.startswith(root + "/"):
-        value = value[len(root) + 1 :]
-    if value.startswith("./"):
-        value = value[2:]
-    return value
-
-
-def diagnostic_from_values(
-    message: Any,
-    file: Any = "",
-    line: Any = 0,
-    column: Any = 0,
-) -> CompileDiagnostic | None:
-    lines = [line.strip() for line in str(message or "").splitlines() if line.strip()]
-    if not lines:
-        return None
-    text = next((line for line in lines if COMPILER_DIAGNOSTIC.match(line)), lines[0])
-
-    match = COMPILER_DIAGNOSTIC.match(text)
-    if match:
-        return CompileDiagnostic(
-            clean_path(match.group("file")),
-            int(match.group("line")),
-            int(match.group("column")),
-            match.group("code").upper(),
-            match.group("message").strip(),
-        )
-
-    code = ""
-    plain_match = PLAIN_COMPILER_ERROR.match(text)
-    if plain_match:
-        code = (plain_match.group("code") or "").upper()
-        text = plain_match.group("message").strip()
-
-    normalized_file = clean_path(file)
-    if not normalized_file:
-        path_match = ASSEMBLY_PATH.search(text)
-        if path_match:
-            normalized_file = clean_path(path_match.group("file"))
-
-    try:
-        normalized_line = int(line or 0)
-        normalized_column = int(column or 0)
-    except (TypeError, ValueError):
-        normalized_line = normalized_column = 0
-
-    return CompileDiagnostic(
-        normalized_file,
-        max(normalized_line, 0),
-        max(normalized_column, 0),
-        code,
-        text,
-    )
-
-
-def sorted_diagnostics(diagnostics: list[CompileDiagnostic]) -> tuple[CompileDiagnostic, ...]:
-    return tuple(
-        sorted(
-            set(diagnostics),
-            key=lambda item: (
-                item.file.casefold(),
-                item.line,
-                item.column,
-                item.code,
-                item.message,
-            ),
-        )
-    )
-
-
-def diagnostics_from_items(items: Any) -> tuple[CompileDiagnostic, ...]:
-    diagnostics: list[CompileDiagnostic] = []
-    if not isinstance(items, list):
-        return ()
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        diagnostic = diagnostic_from_values(
-            item.get("message"),
-            item.get("file"),
-            item.get("line"),
-            item.get("column"),
-        )
-        if diagnostic:
-            diagnostics.append(diagnostic)
-    return sorted_diagnostics(diagnostics)
-
-
-def parse_cold_compile_log(log: str) -> tuple[CompileDiagnostic, ...]:
-    diagnostics: list[CompileDiagnostic] = []
-    for raw_line in ANSI_ESCAPE.sub("", log).splitlines():
-        line = raw_line.strip()
-        if line.startswith("##utp:"):
-            # Test-protocol JSON that repeats the plain log line.
-            continue
-        diagnostic = diagnostic_from_values(line)
-        if COMPILER_DIAGNOSTIC.match(line) and diagnostic:
-            diagnostics.append(diagnostic)
-            continue
-        if PLAIN_COMPILER_ERROR.match(line) and diagnostic:
-            diagnostics.append(diagnostic)
-            continue
-        if ASSEMBLY_ERROR.search(line) and (
-            "error" in line.casefold()
-            or "exception" in line.casefold()
-            or re.search(
-                r"assembly (?:has|with name)|cyclic references?|duplicate references?",
-                line,
-                re.IGNORECASE,
-            )
-        ):
-            # Setup errors do not consistently use the compiler's file(line,column)
-            # form, but Unity includes an asmdef/asmref path or an explicit error label.
-            if diagnostic:
-                diagnostics.append(diagnostic)
-    return sorted_diagnostics(diagnostics)
-
-
-def format_diagnostic(diagnostic: CompileDiagnostic) -> str:
-    location = diagnostic.file
-    if location and diagnostic.line:
-        location += f":{diagnostic.line}"
-        if diagnostic.column:
-            location += f":{diagnostic.column}"
-    label = "error" + (f" {diagnostic.code}" if diagnostic.code else "")
-    return " ".join(part for part in (location, f"{label}:", diagnostic.message) if part)
-
-
-def error_cause(detail: str) -> str:
-    """Return one compact, field-safe cause."""
-    lines = compact_message(detail)
-    return (
-        ANSI_ESCAPE.sub("", lines[0]).replace(";", ",")[:160]
-        if lines
-        else "unknown"
-    )
-
-
-def print_compile_errors(diagnostics: tuple[CompileDiagnostic, ...], stage: str) -> int:
-    if not diagnostics:
-        print(
-            f"ERR compile_verify; stage={stage}; cause=Unity reports compilation "
-            "errors but returned no diagnostics; tests=skipped"
-        )
-        return EXIT_ENVIRONMENT_FAILURE
-    print(f"ERR compile_failed; errors={len(diagnostics)}; tests=skipped")
-    for diagnostic in diagnostics:
-        print(format_diagnostic(diagnostic))
-    return EXIT_COMPILATION_FAILURE
-
-
-def test_seconds(result: dict[str, Any]) -> float:
-    try:
-        return float(result.get("Duration") or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def format_seconds(seconds: float) -> str:
-    return f"{seconds:.3g}s" if seconds >= 1 else f"{seconds * 1000:.3g}ms"
-
-
-def print_report(result: dict[str, Any], requested_filter: str) -> int:
-    summary = result.get("Summary") or {}
-    results = result.get("Results") or []
-
-    total = int(summary.get("Total") or 0)
-    passed = int(summary.get("Passed") or 0)
-    failed = int(summary.get("Failed") or 0)
-    skipped = int(summary.get("Skipped") or 0)
-    inconclusive = int(summary.get("Inconclusive") or 0)
-    duration = float(result.get("Duration") or 0.0)
-
-    if total == 0:
-        print(
-            f"ERR tests_none; filter={requested_filter or 'none'}; "
-            "mode=EditMode; fix=check filter/tests"
-        )
-        return EXIT_ENVIRONMENT_FAILURE
-
-    # Slowest first. Passed tests over the limit count as failures.
-    by_time = sorted(results, key=test_seconds, reverse=True)
-    too_slow = [
-        item
-        for item in by_time
-        if item.get("Status") == "Passed" and test_seconds(item) > TEST_FAIL_SECONDS
-    ]
-    slow = [
-        item
-        for item in by_time
-        if TEST_WARN_SECONDS < test_seconds(item) <= TEST_FAIL_SECONDS
-    ]
-    passed -= len(too_slow)
-    failed += len(too_slow)
-
-    status = "PASS" if failed == 0 and inconclusive == 0 else "FAIL"
-    fields = [
-        f"total={total}",
-        f"passed={passed}",
-        f"failed={failed}",
-    ]
-    if too_slow:
-        fields.append(f"too_slow={len(too_slow)}")
-    if skipped:
-        fields.append(f"skipped={skipped}")
-    if inconclusive:
-        fields.append(f"inconclusive={inconclusive}")
-    fields.append(f"duration={duration:.2f}s")
-    fields.append(f"mode={result.get('Mode') or 'unknown'}")
-    if requested_filter:
-        fields.append(f"filter={requested_filter}")
-    print(f"{status} tests; " + " ".join(fields))
-
-    failures = [item for item in results if item.get("Status") == "Failed"]
-    for index, failure in enumerate(failures, start=1):
-        print(f"[{index}] {failure.get('FullName') or '<unnamed test>'}")
-        for line in compact_message(failure.get("Message")):
-            print(f"  {line}")
-        for location in compact_locations(failure.get("StackTrace")):
-            print(f"  at {location}")
-    expectation = (
-        f"tests fail over {format_seconds(TEST_FAIL_SECONDS)} and are expected "
-        f"to finish in under {format_seconds(TEST_EXPECTED_SECONDS)}"
-    )
-    for index, item in enumerate(too_slow, start=len(failures) + 1):
-        print(f"[{index}] {item.get('FullName') or '<unnamed test>'}")
-        print(f"  Took {format_seconds(test_seconds(item))}; {expectation}.")
-
-    if slow:
-        print(
-            f"WARN slow_tests; count={len(slow)}; "
-            f"over={format_seconds(TEST_WARN_SECONDS)}; hint={expectation}"
-        )
-        for item in slow:
-            print(
-                f"  {format_seconds(test_seconds(item))} "
-                f"{item.get('FullName') or '<unnamed test>'}"
-            )
-
-    frame_tests = int(result.get("FrameTests") or 0)
-    if frame_tests:
-        print(
-            f"NOTE frame_tests; count={frame_tests}; "
-            f"duration={float(result.get('FrameDuration') or 0.0):.2f}s; "
-            "hint=use [Test], not [UnityTest]/[UnitySetUp]/[UnityTearDown]"
-        )
-
-    return EXIT_SUCCESS if status == "PASS" else EXIT_TEST_FAILURE
-
-
-def report_runner_result(payload: dict[str, Any], test_filter: str, stage: str) -> int | None:
-    """Print the runner's tests or compile errors; None for any other state.
-
-    An older com.unity.pipeline is reported whatever the state.
-    """
-    pipeline = str(payload.get("pipeline") or "")
-    if not version_is_at_least(pipeline, REQUIRED_PIPELINE_VERSION):
-        print(
-            f"ERR pipeline_version; got={pipeline or 'unknown'}; "
-            f"min={REQUIRED_PIPELINE_VERSION}; "
-            "fix=let Unity resolve packages/update com.unity.pipeline"
-        )
-        return EXIT_ENVIRONMENT_FAILURE
-    if payload["state"] == "tests":
-        return print_report(payload, test_filter)
-    if payload["state"] == "compile_failed":
-        return print_compile_errors(diagnostics_from_items(payload.get("diagnostics")), stage)
-    return None
-
-
-def warm_verification(
-    executable: str, environment: dict[str, str], test_filter: str
-) -> int | None:
-    """Compile and test in the open Editor through UnityVerifyRunner.cs.
-
-    Returns None when no warm Editor answers, so the caller can use the cold
-    path. The runner answers "playing" or "busy" until the Editor is in edit
-    mode and done compiling, importing and reloading; play mode is stopped
-    once, then the runner is called again until UNITY_TIMEOUT_SECONDS. Once
-    the Editor has answered, failed calls are retried as well, since a domain
-    reload drops the connection.
-    """
-    deadline = time.monotonic() + UNITY_TIMEOUT_SECONDS
-    answered = False
-    stop_sent = False
-    state = ""
-    while True:
-        try:
-            envelope: dict[str, Any] | None = run_runner(executable, environment, test_filter)
-        except subprocess.TimeoutExpired:
-            print(
-                f"ERR tests_timeout; path=warm; limit={UNITY_TIMEOUT_SECONDS + 10}s; "
-                "fix=check Editor/log"
-            )
-            return EXIT_ENVIRONMENT_FAILURE
-        except OSError as error:
-            print(
-                f"ERR tests_start; path=warm; cause={error_cause(str(error))}; "
-                "fix=check CLI/PATH"
-            )
-            return EXIT_ENVIRONMENT_FAILURE
-        except (json.JSONDecodeError, ValueError):
-            envelope = None
-
-        if envelope is not None and envelope.get("success"):
-            answered = True
-            try:
-                payload = runner_payload(envelope)
-            except ValueError as error:
-                print(f"ERR runner; cause={error_cause(str(error))}; fix=check CLI/Editor")
-                return EXIT_ENVIRONMENT_FAILURE
-            reported = report_runner_result(payload, test_filter, "warm")
-            if reported is not None:
-                return reported
-            state = payload["state"]
-            if state == "playing" and not stop_sent:
-                failure = stop_play_mode(executable, environment)
-                if failure is not None:
-                    print(
-                        f"ERR edit_mode; cause={error_cause(failure)}; "
-                        "fix=check CLI/Editor, exit play mode"
-                    )
-                    return EXIT_ENVIRONMENT_FAILURE
-                stop_sent = True
-            elif state not in {"playing", "busy"}:
-                print(f"ERR runner; cause=unknown state {state}; fix=update unity-verify")
-                return EXIT_ENVIRONMENT_FAILURE
-        elif not answered:
-            if envelope is None:
-                print("ERR cli_response; stage=warm; cause=invalid_json; fix=retry/update CLI")
-                return EXIT_ENVIRONMENT_FAILURE
-            if warm_editor_unavailable(envelope):
-                return None
-            detail = "\n".join(error_messages(envelope))
-            print(
-                f"ERR unity_command; stage=warm; cause={error_cause(detail)}; "
-                "fix=check CLI/Editor"
-            )
-            return EXIT_ENVIRONMENT_FAILURE
-
-        if time.monotonic() >= deadline:
-            if state == "playing":
-                print(
-                    f"ERR edit_mode; cause=Unity Editor stayed in play mode for "
-                    f"{UNITY_TIMEOUT_SECONDS}s after editor_stop; "
-                    "fix=check CLI/Editor, exit play mode"
-                )
-            else:
-                print(
-                    f"ERR compile_timeout; path=warm; limit={UNITY_TIMEOUT_SECONDS}s; "
-                    "fix=check reload/Editor"
-                )
-            return EXIT_ENVIRONMENT_FAILURE
-        time.sleep(WARM_POLL_SECONDS)
-
-
-def cold_verification(
-    executable: str, environment: dict[str, str], test_filter: str
-) -> int:
-    """Compile and test in one headless Editor through UnityVerifyRunner.cs.
-
-    Reached when no warm Editor answers. `unity run --command run_script`
-    opens the project in batch mode, which imports and compiles it, and then
-    runs the same runner as the warm path. Batch mode stops before the runner
-    when scripts don't compile, so compile errors come from the Editor log.
-    """
-    # The Android module starts an adb server while the Editor loads, which
-    # takes about 3s with adb's libusb backend on macOS and a fraction of that
-    # with the native one. Nothing here talks to devices.
-    environment = {"ADB_LIBUSB": "0", **environment}
-    with tempfile.TemporaryDirectory(prefix="unity-verify-") as temporary_directory:
-        log_path = Path(temporary_directory) / "editor.log"
-        command = [
-            executable,
-            "--no-banner",
-            "--no-pager",
-            "--non-interactive",
-            "--format",
-            "json",
-            "run",
-            str(PROJECT_ROOT),
-            "--timeout",
-            str(COLD_TIMEOUT_SECONDS),
-            "--log-file",
-            str(log_path),
-            "--no-tail",
-            "--command",
-            "run_script",
-            "--",
-            *runner_arguments(test_filter),
-        ]
-        try:
-            completed = run_process(command, environment, COLD_TIMEOUT_SECONDS + 10)
-        except subprocess.TimeoutExpired:
-            print(
-                f"ERR tests_timeout; path=cold; limit={COLD_TIMEOUT_SECONDS}s; "
-                "fix=check Editor/log"
-            )
-            return EXIT_ENVIRONMENT_FAILURE
-        except OSError as error:
-            print(
-                f"ERR tests_start; path=cold; cause={error_cause(str(error))}; "
-                "fix=check CLI/PATH"
-            )
-            return EXIT_ENVIRONMENT_FAILURE
-
-        try:
-            envelope = cli_envelope(completed)
-        except (json.JSONDecodeError, ValueError):
-            envelope = {}
-        if envelope.get("success"):
-            try:
-                payload = runner_payload(envelope)
-            except ValueError as error:
-                print(f"ERR runner; cause={error_cause(str(error))}; fix=check CLI/Editor")
-                return EXIT_ENVIRONMENT_FAILURE
-            reported = report_runner_result(payload, test_filter, "cold")
-            if reported is not None:
-                return reported
-            print(
-                f"ERR runner; cause=headless Editor stayed {payload['state']}; "
-                "fix=check Editor/log"
-            )
-            return EXIT_ENVIRONMENT_FAILURE
-
-        try:
-            log = log_path.read_text(errors="replace")
-        except OSError:
-            log = ""
-        diagnostics = parse_cold_compile_log(log)
-        if diagnostics:
-            return print_compile_errors(diagnostics, "cold")
-        # The CLI only says that Unity exited; batch mode logs why after this line.
-        aborted = log.partition("Aborting batchmode due to failure:")[2].strip()
-        detail = aborted or cli_error_detail(completed)
-        print(
-            f"ERR unity_command; stage=cold; cause={error_cause(detail)}; "
-            "fix=check CLI/Editor/log"
-        )
-        return EXIT_ENVIRONMENT_FAILURE
-
-
-def project_open_in_editor() -> bool:
-    """Whether an Editor holds the project's lock, so the warm path can answer."""
-    try:
-        descriptor = os.open(PROJECT_ROOT / "Temp" / "UnityLockfile", os.O_RDONLY)
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return True
-    else:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        return False
-    finally:
-        os.close(descriptor)
-
-
-def main() -> int:
-    global PROJECT_ROOT
-    args = parse_args()
-    start = Path(args.project_path or Path.cwd()).expanduser().resolve()
-    project_root = find_project_root(start)
-    if project_root is None:
-        print(
-            f"ERR project_missing; path={start}; "
-            "fix=run inside a Unity project or pass --project-path",
-            file=sys.stderr,
-        )
-        return EXIT_ENVIRONMENT_FAILURE
-    PROJECT_ROOT = project_root
-
-    executable = shutil.which(UNITY_EXECUTABLE)
-    if not executable or not Path(executable).is_file():
-        print(
-            f"ERR cli_missing; exe={UNITY_EXECUTABLE}; fix=ask user to install CLI or add it to PATH",
-            file=sys.stderr,
-        )
-        return EXIT_ENVIRONMENT_FAILURE
-
-    environment = os.environ.copy()
-    # The test run is local; avoid an unrelated network update check.
-    environment.setdefault("UNITY_NO_UPDATE_CHECK", "1")
-
-    installed_version = unity_cli_version(str(executable), environment)
-    if not installed_version or not version_is_at_least(
-        installed_version, REQUIRED_UNITY_CLI_VERSION
-    ):
-        found = installed_version or "unknown"
-        print(
-            f"ERR cli_version; got={found}; min={REQUIRED_UNITY_CLI_VERSION}; "
-            "fix=unity upgrade"
-        )
-        return EXIT_ENVIRONMENT_FAILURE
-
-    if project_open_in_editor():
-        warm_exit = warm_verification(str(executable), environment, args.filter)
-        if warm_exit is not None:
-            return warm_exit
-    return cold_verification(str(executable), environment, args.filter)
-
-
-if __name__ == "__main__":
-    try:
-        exit_code = main()
-    except KeyboardInterrupt:
-        print("ERR interrupted; stage=unknown; fix=rerun", file=sys.stderr)
-        exit_code = EXIT_INTERRUPTED
-    raise SystemExit(exit_code)
+#!/bin/bash
+''':'
+# Run a Unity project's EditMode tests and print a compact report.
+#
+#   unity-verify [--project-path PATH] [FILTER]
+#
+# The package's Editor code (Editor/*.cs) compiles the project, runs the tests
+# and writes the report. This script only hands it a request through files in
+# Library/UnityVerify (see Editor/Protocol.cs): to the Editor that has the
+# project open, or else to a batch-mode Editor it starts for the run.
+#
+# Exit codes: 0 passed, 1 tests failed, 2 compile errors, 3 tooling or
+# environment problem, 130 interrupted.
+#
+# Written for bash 3.2, which macOS ships. To python3 the file is one string plus
+# the stub after `exit`, which hands over to bash, so callers that run it with
+# python3 work too; the bash part avoids backslash escapes Python doesn't know.
+
+set -u
+
+PROTOCOL="unity-verify 1"
+WARM_LIMIT=330    # seconds for compiling, reloading and testing in the open Editor
+COLD_LIMIT=660    # seconds for importing, compiling and testing in a batch-mode Editor
+SILENT_LIMIT=60   # seconds the open Editor may take to pick up a request
+EXIT_ENVIRONMENT=3
+EXIT_INTERRUPTED=130
+NEWLINE='
+'
+
+usage() {
+  echo "usage: unity-verify [--project-path PATH] [FILTER]"
+}
+
+help() {
+  usage
+  cat <<'EOF'
+
+Compile the Unity project and run its EditMode tests, in the open Editor when
+one has the project open, otherwise in a batch-mode Editor. With FILTER, run only
+tests whose fixture or method name contains it (case-insensitive).
+
+  --project-path PATH  Unity project root; defaults to the project containing
+                       the working directory
+  UNITY_EDITOR         Unity binary (or Unity.app) to use when no Editor is open;
+                       defaults to the version in ProjectVersion.txt from Unity Hub
+EOF
+}
+
+args_error() {
+  usage >&2
+  echo "ERR args; cause=$1; fix=run unity-verify [FILTER]" >&2
+  exit "$EXIT_ENVIRONMENT"
+}
+
+filter=""
+have_filter=0
+project_path=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h | --help) help; exit 0 ;;
+    --project-path)
+      [ $# -ge 2 ] || args_error "--project-path needs a PATH"
+      project_path=$2
+      shift 2
+      ;;
+    --project-path=*) project_path=${1#*=}; shift ;;
+    -*) args_error "unrecognized arguments: $1" ;;
+    *)
+      [ "$have_filter" = 0 ] || args_error "unrecognized arguments: $1"
+      filter=$1
+      have_filter=1
+      shift
+      ;;
+  esac
+done
+case "$filter" in
+  *"$NEWLINE"*) args_error "FILTER has a line break" ;;
+esac
+
+# The nearest Unity project at or above $1.
+find_project() {
+  local dir=$1
+  while :; do
+    if [ -d "$dir/Assets" ] && [ -f "$dir/ProjectSettings/ProjectVersion.txt" ]; then
+      echo "$dir"
+      return 0
+    fi
+    [ "$dir" = / ] && return 1
+    dir=$(dirname "$dir")
+  done
+}
+
+start=$(cd "${project_path:-.}" 2>/dev/null && pwd -P) || start=${project_path:-$PWD}
+project=$(find_project "$start") || {
+  echo "ERR project_missing; path=$start; fix=run inside a Unity project or pass --project-path" >&2
+  exit "$EXIT_ENVIRONMENT"
+}
+
+box="$project/Library/UnityVerify"
+requests="$box/requests"
+responses="$box/responses"
+mkdir -p "$requests" "$responses" || {
+  echo "ERR library; path=$box; fix=check the project's Library folder" >&2
+  exit "$EXIT_ENVIRONMENT"
+}
+# Answers for runs that were interrupted.
+find "$responses" -type f -mtime +1 -exec rm -f {} + 2>/dev/null
+
+id="$(date +%Y%m%d%H%M%S)-$$-$RANDOM"
+request="$requests/$id.request"
+state="$responses/$id.state"
+response="$responses/$id.response"
+log="$box/editor.log"
+unity_pid=""
+
+cleanup() {
+  rm -f "$request" "$request.tmp" "$state" "$response"
+}
+
+stop_unity() {
+  [ -n "$unity_pid" ] || return 0
+  kill -TERM -- "-$unity_pid" 2>/dev/null
+  local waited=0
+  while kill -0 "$unity_pid" 2>/dev/null && [ "$waited" -lt 100 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  kill -KILL -- "-$unity_pid" 2>/dev/null
+  wait "$unity_pid" 2>/dev/null
+  unity_pid=""
+}
+
+trap cleanup EXIT
+trap 'stop_unity; echo "ERR interrupted; fix=rerun" >&2; exit $EXIT_INTERRUPTED' INT TERM
+
+write_request() {
+  printf '%s\n%s\n' "$PROTOCOL" "$filter" > "$request.tmp" && mv "$request.tmp" "$request"
+}
+
+# Print the report in $response and return its exit code.
+print_response() {
+  local code
+  {
+    IFS= read -r code
+    cat
+  } < "$response"
+  case "$code" in
+    '' | *[!0-9]*) return "$EXIT_ENVIRONMENT" ;;
+  esac
+  return "$code"
+}
+
+# "editor PID" for an interactive Editor that has the project open, "batch PID"
+# for a batch-mode one, nothing otherwise.
+open_editor() {
+  local pid command lower before rest path kind
+  ps -axww -o pid=,command= 2>/dev/null | while read -r pid command; do
+    case "$command" in
+      *"/Unity "*) ;;
+      *) continue ;;
+    esac
+    case "$command" in
+      *AssetImportWorker*) continue ;;
+    esac
+    lower=$(printf '%s' "$command" | tr '[:upper:]' '[:lower:]')
+    before=${lower%%"-projectpath "*}
+    [ "$before" != "$lower" ] || continue
+    rest=${command:$((${#before} + 13))}
+    path=${rest%%" -"*}
+    path=$(cd "$path" 2>/dev/null && pwd -P) || continue
+    [ "$path" = "$project" ] || continue
+    case "$lower" in
+      *-batchmode*) kind=batch ;;
+      *) kind=editor ;;
+    esac
+    echo "$kind $pid"
+    break
+  done
+}
+
+# The Unity binary for the project's Editor version, found the way Unity Hub
+# finds installs. Prints the version and fails when there is none.
+editor_binary() {
+  if [ -n "${UNITY_EDITOR:-}" ]; then
+    case "$UNITY_EDITOR" in
+      *.app | *.app/) echo "${UNITY_EDITOR%/}/Contents/MacOS/Unity" ;;
+      *) echo "$UNITY_EDITOR" ;;
+    esac
+    return 0
+  fi
+  local version hub install inner custom entry location candidate
+  version=$(sed -n 's/^m_EditorVersion:[[:space:]]*//p' "$project/ProjectSettings/ProjectVersion.txt" | tr -d '\r ')
+  case "$(uname -s)" in
+    Darwin)
+      hub="$HOME/Library/Application Support/UnityHub"
+      install=/Applications/Unity/Hub/Editor
+      inner=Unity.app/Contents/MacOS/Unity
+      ;;
+    *)
+      hub="${XDG_CONFIG_HOME:-$HOME/.config}/UnityHub"
+      install="$HOME/Unity/Hub/Editor"
+      inner=Editor/Unity
+      ;;
+  esac
+  # Unity Hub's install folder, when it was moved from the default.
+  custom=$(head -n 1 "$hub/secondaryInstallPath.json" 2>/dev/null | tr -d '"\r')
+  [ -n "$custom" ] && install=$custom
+  if [ -x "$install/$version/$inner" ]; then
+    echo "$install/$version/$inner"
+    return 0
+  fi
+  # Editors added to Unity Hub from disk.
+  entry=$(tr '{' '\n' < "$hub/editors-v2.json" 2>/dev/null | grep -F "\"version\":\"$version\"" | head -n 1)
+  location=${entry#*'"location":["'}
+  location=${location%%'"'*}
+  if [ -n "$entry" ] && [ "$location" != "$entry" ]; then
+    for candidate in "$location/Contents/MacOS/Unity" "$location/Editor/Unity" "$location"; do
+      if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+        echo "$candidate"
+        return 0
+      fi
+    done
+  fi
+  echo "$version"
+  return 1
+}
+
+# Run in the Editor that has the project open (process $1).
+warm() {
+  local pid=$1 sent=$SECONDS beat
+  write_request || return "$EXIT_ENVIRONMENT"
+  while [ ! -f "$response" ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "ERR editor_exited; pid=$pid; fix=rerun"
+      return "$EXIT_ENVIRONMENT"
+    fi
+    if [ ! -f "$state" ] && [ $((SECONDS - sent)) -ge "$SILENT_LIMIT" ]; then
+      beat=$(head -n 1 "$box/heartbeat" 2>/dev/null)
+      if [ "$beat" = "$pid" ]; then
+        echo "ERR editor_unresponsive; pid=$pid; cause=no Editor update for ${SILENT_LIMIT}s; fix=close dialogs in the Editor, or restart it"
+      else
+        echo "ERR editor_unprepared; pid=$pid; cause=the open Editor hasn't loaded dev.minis.unity-verify; fix=let it finish importing, check its Console for compile errors or Safe Mode, or close it"
+      fi
+      return "$EXIT_ENVIRONMENT"
+    fi
+    if [ $((SECONDS - sent)) -ge "$WARM_LIMIT" ]; then
+      echo "ERR timeout; path=warm; state=$(head -n 1 "$state" 2>/dev/null || echo waiting); limit=${WARM_LIMIT}s; fix=check the Editor"
+      return "$EXIT_ENVIRONMENT"
+    fi
+    sleep 0.1
+  done
+  print_response
+}
+
+# Run a batch-mode Editor on the request until it exits or COLD_LIMIT runs out.
+# Returns Unity's exit code, or 124 on timeout.
+launch() {
+  local code
+  # The Android module starts an adb server while the Editor loads, which takes
+  # about 3s with adb's libusb backend on macOS and a fraction of that with the
+  # native one. Nothing here talks to devices.
+  set -m  # own process group, so Ctrl-C reaches only this script
+  ADB_LIBUSB=${ADB_LIBUSB-0} "$editor" -batchmode -projectPath "$project" -logFile "$log" \
+    -executeMethod UnityVerify.Batch.Run -unityVerifyRequest "$request" \
+    < /dev/null > /dev/null 2>&1 &
+  unity_pid=$!
+  set +m
+  while kill -0 "$unity_pid" 2>/dev/null; do
+    if [ $((SECONDS - started)) -ge "$COLD_LIMIT" ]; then
+      stop_unity
+      return 124
+    fi
+    sleep 0.2
+  done
+  wait "$unity_pid"
+  code=$?
+  unity_pid=""
+  return "$code"
+}
+
+# Compile errors in the log, in the Editor code's format: the compiler's
+# file(line,column) lines, and assembly definition problems (duplicate names,
+# cyclic dependencies), which Unity logs with the .asmdef path. Without repeats,
+# with project-relative paths.
+compile_errors() {
+  {
+    sed -n -E 's/^(.+)[(]([0-9]+),([0-9]+)[)]: error ([A-Za-z]+[0-9]+): (.*)$/\1:\2:\3 error \4: \5/p' "$log"
+    grep -i -E 'assembly (definition|reference|has|with name)|cyclic (references?|dependenc)|duplicate references?|[.]asm(def|ref)' "$log" |
+      grep -i -E 'error|exception|assembly (has|with name)|cyclic (references?|dependenc)|duplicate references?' |
+      grep -v -E '^[^ ]+[(][0-9]+,[0-9]+[)]: |^-|LogAssemblyErrors' |
+      while IFS= read -r line; do
+        file=$(printf '%s\n' "$line" | grep -o -E '(Assets|Packages)/[^(),]*[.]asm(def|ref)' | head -n 1)
+        line=${line#error: }
+        echo "${file:+$file }error: $line"
+      done
+  } | tr -d '\r' | while IFS= read -r line; do echo "${line#"$project/"}"; done |
+    sort -u | sort -t : -k 1,1f -k 2,2n -k 3,3n
+}
+
+# Start a batch-mode Editor for the run.
+cold() {
+  local editor started=$SECONDS code cause errors
+  editor=$(editor_binary) || {
+    echo "ERR editor_missing; version=$editor; fix=install it with Unity Hub, or set UNITY_EDITOR to the Unity binary"
+    return "$EXIT_ENVIRONMENT"
+  }
+  write_request || return "$EXIT_ENVIRONMENT"
+  launch
+  code=$?
+  if [ ! -f "$response" ] && [ "$code" != 124 ] && grep -q "Scripts have compiler errors" "$log" 2>/dev/null; then
+    # Batch mode stops right after a failed compile, before any project code
+    # (this package's included) loads, so the errors come from the log.
+    errors=$(compile_errors)
+    if [ -z "$errors" ]; then
+      echo "ERR compile_verify; stage=cold; cause=Unity reports compilation errors but logged none it could read; log=Library/UnityVerify/editor.log; fix=check the log"
+      return "$EXIT_ENVIRONMENT"
+    fi
+    echo "ERR compile_failed; errors=$(printf '%s\n' "$errors" | wc -l | tr -d ' '); tests=skipped"
+    printf '%s\n' "$errors"
+    return 2
+  fi
+  if [ "$code" = 124 ]; then
+    echo "ERR tests_timeout; path=cold; limit=${COLD_LIMIT}s; log=Library/UnityVerify/editor.log; fix=check the log"
+    return "$EXIT_ENVIRONMENT"
+  fi
+  if [ -f "$response" ]; then
+    print_response
+    return
+  fi
+  # Unity stopped before it ran the request.
+  cause=$(sed -n '/Aborting batchmode due to failure:/{n;p;q;}' "$log" 2>/dev/null)
+  [ -n "$cause" ] || cause=$(grep -m 1 '^executeMethod' "$log" 2>/dev/null)
+  [ -n "$cause" ] || cause="Unity exited before running the tests"
+  cause=$(printf '%s' "$cause" | tr ';' ',' | cut -c 1-160)
+  echo "ERR unity_exited; code=$code; cause=$cause; log=Library/UnityVerify/editor.log; fix=check the log"
+  return "$EXIT_ENVIRONMENT"
+}
+
+waited=0
+while :; do
+  found=$(open_editor)
+  case "$found" in
+    "editor "*) warm "${found#editor }"; exit $? ;;
+    "batch "*)
+      # Another batch-mode run has the project; wait for it.
+      if [ "$waited" -ge "$COLD_LIMIT" ]; then
+        echo "ERR project_busy; pid=${found#batch }; cause=a batch-mode Unity has the project open; fix=wait for it or stop it"
+        exit "$EXIT_ENVIRONMENT"
+      fi
+      sleep 1
+      waited=$((waited + 1))
+      ;;
+    *) cold; exit $? ;;
+  esac
+done
+'''
+import os, sys
+os.execv("/bin/bash", ["/bin/bash", os.path.abspath(__file__)] + sys.argv[1:])
+# '

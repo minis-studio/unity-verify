@@ -1,89 +1,55 @@
-#!/usr/bin/env python3
+#!/bin/bash
 # unity-verify shim. Installed by dev.minis.unity-verify; commit it, don't edit it.
-"""Find the dev.minis.unity-verify package for this project and run its tool.
+#
+# Finds the dev.minis.unity-verify package for this project and runs its tool.
+# The tool lives in the package's Tools~ folder, so the version a project runs
+# is the version its Packages/manifest.json pins. This file only locates it: in
+# Library/PackageCache once Unity has resolved the git dependency, or in a clone
+# of the pinned tag until then.
 
-The tool itself lives in the package's Tools~ folder, so the version a project
-runs is the version its Packages/manifest.json pins. This file only locates it:
-in Library/PackageCache once Unity has resolved the git dependency, or in a
-clone of the pinned tag until then.
-"""
+set -u
 
-from __future__ import annotations
+package=dev.minis.unity-verify
+tool="Tools~/unity-verify"
+root=$(cd "$(dirname "$0")" && pwd -P)
 
-import json
-import os
-import subprocess
-import sys
-import tempfile
-from pathlib import Path
+# Newest resolved copy first.
+found=$(ls -td "$root/Library/PackageCache/$package@"* 2>/dev/null | while IFS= read -r candidate; do
+  if [ -f "$candidate/$tool" ]; then
+    echo "$candidate"
+    break
+  fi
+done)
 
+if [ -z "$found" ]; then
+  # Clone the pinned tag into a user cache, for checkouts Unity has not resolved yet.
+  spec=$(grep -F "\"$package\"" "$root/Packages/manifest.json" 2>/dev/null | head -n 1 | cut -d '"' -f 4)
+  url=${spec%%#*}
+  tag=${spec#*#}
+  case "$url" in
+    *://*)
+      if [ "$tag" != "$spec" ] && [ -n "$tag" ]; then
+        cache="${XDG_CACHE_HOME:-$HOME/.cache}/unity-verify"
+        found="$cache/$(echo "$tag" | tr / _)"
+        if [ ! -f "$found/$tool" ]; then
+          echo "unity-verify: fetching $spec into $cache" >&2
+          mkdir -p "$cache" && staging=$(mktemp -d "$cache/.fetch.XXXXXX") || exit 3
+          if ! git clone --quiet --depth 1 --branch "$tag" "$url" "$staging/checkout" 2> "$staging/error"; then
+            cause=$(tail -n 1 "$staging/error" | tr ';' ',' | cut -c 1-160)
+            rm -rf "$staging"
+            echo "ERR package_fetch; pkg=$package; cause=${cause:-unknown}; fix=check network/git access, or open the project in Unity once" >&2
+            exit 3
+          fi
+          [ -e "$found" ] || mv "$staging/checkout" "$found"
+          rm -rf "$staging"
+        fi
+      fi
+      ;;
+  esac
+fi
 
-PACKAGE = "dev.minis.unity-verify"
-TOOL = Path("Tools~") / "unity-verify"
-PROJECT_ROOT = Path(__file__).resolve().parent
-EXIT_ENVIRONMENT_FAILURE = 3
-
-
-def manifest_spec() -> str:
-    try:
-        manifest = json.loads((PROJECT_ROOT / "Packages" / "manifest.json").read_text())
-        return str(manifest["dependencies"][PACKAGE])
-    except (OSError, ValueError, KeyError, TypeError):
-        return ""
-
-
-def fetch_package(spec: str) -> Path | None:
-    """Clone the pinned tag into a user cache, for checkouts Unity has not resolved yet."""
-    url, _, tag = spec.partition("#")
-    if "://" not in url or not tag:
-        return None
-    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "unity-verify"
-    target = cache / tag.replace("/", "_")
-    if (target / TOOL).is_file():
-        return target
-
-    print(f"unity-verify: fetching {spec} into {cache}", file=sys.stderr)
-    try:
-        cache.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=cache) as staging:
-            checkout = Path(staging) / "checkout"
-            subprocess.run(
-                ["git", "clone", "--quiet", "--depth", "1", "--branch", tag, url, str(checkout)],
-                capture_output=True, text=True, timeout=120, check=True,
-            )
-            if not target.exists():
-                checkout.rename(target)
-    except (OSError, subprocess.SubprocessError) as error:
-        stderr = getattr(error, "stderr", "") or str(error)
-        cause = (stderr.strip().splitlines() or ["unknown"])[-1].replace(";", ",")[:160]
-        print(
-            f"ERR package_fetch; pkg={PACKAGE}; cause={cause}; "
-            "fix=check network/git access, or open the project in Unity once",
-            file=sys.stderr,
-        )
-        raise SystemExit(EXIT_ENVIRONMENT_FAILURE)
-    return target
-
-
-def main() -> int:
-    cached = (PROJECT_ROOT / "Library" / "PackageCache").glob(f"{PACKAGE}@*")
-    candidates = sorted(cached, key=lambda path: path.stat().st_mtime, reverse=True)
-    package = next((path for path in candidates if (path / TOOL).is_file()), None)
-    if package is None:
-        package = fetch_package(manifest_spec())
-    if package is None:
-        print(
-            f"ERR package_missing; pkg={PACKAGE}; "
-            "fix=add the package to Packages/manifest.json, open Unity once",
-            file=sys.stderr,
-        )
-        return EXIT_ENVIRONMENT_FAILURE
-
-    os.execv(
-        sys.executable,
-        [sys.executable, str(package.resolve() / TOOL), "--project-path", str(PROJECT_ROOT), *sys.argv[1:]],
-    )
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if [ -z "$found" ] || [ ! -f "$found/$tool" ]; then
+  echo "ERR package_missing; pkg=$package; fix=add the package to Packages/manifest.json, open Unity once" >&2
+  exit 3
+fi
+exec /bin/bash "$found/$tool" --project-path "$root" "$@"

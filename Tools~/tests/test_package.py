@@ -1,12 +1,11 @@
-"""Tests for the packaging layer and the tool's warm and cold paths, without Unity.
+"""Tests for the scripts in Tools~, with stand-ins for Unity.
 
-Run from the package root: python3 -m unittest discover -s 'Tools~/tests'
+The Editor code has its own EditMode tests in Tests/Editor. Run these from the
+package root: python3 -m unittest discover -s 'Tools~/tests'
 """
 
 from __future__ import annotations
 
-import fcntl
-import importlib.util
 import json
 import os
 import shutil
@@ -14,68 +13,99 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
-from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 TOOLS = PACKAGE_ROOT / "Tools~"
-PACKAGE_JSON = json.loads((PACKAGE_ROOT / "package.json").read_text())
-PACKAGE = PACKAGE_JSON["name"]
-PIPELINE = PACKAGE_JSON["dependencies"]["com.unity.pipeline"]
+PACKAGE = json.loads((PACKAGE_ROOT / "package.json").read_text())["name"]
+BASH = "/bin/bash"
 
 # Stands in for Tools~/unity-verify: reports how it was called.
 STUB_TOOL = textwrap.dedent(
     """\
-    #!/usr/bin/env python3
-    import json, sys
-    print(json.dumps({"tool": __file__, "argv": sys.argv[1:]}))
-    raise SystemExit(7)
+    #!/bin/bash
+    echo "$0"
+    for argument in "$@"; do echo "$argument"; done
+    exit 7
     """
 )
 
-# Stands in for the Unity CLI: answers run_script, in the open Editor or in a
-# headless one (run --command run_script), with the next reply in
-# $FAKE_UNITY_REPLIES (a JSON list, consumed in order) and logs each command.
-# A reply's "log" is written to the headless Editor's --log-file, and a
-# reply without "pipeline" reports the version package.json depends on.
+# Stands in for a batch-mode Unity: records its arguments and answers the request
+# with $FAKE_UNITY_REPLY, or stops early the way $FAKE_UNITY_MODE says.
 FAKE_UNITY = textwrap.dedent(
     """\
-    #!/usr/bin/env python3
-    import json, os, sys
-    args = sys.argv[1:]
-    if args == ["--version"]:
-        print("1.0.0-beta.12")
-        raise SystemExit(0)
-    name = args[args.index("command") + 5] if "command" in args else args[5]
-    with open(os.environ["FAKE_UNITY_LOG"], "a") as log:
-        log.write(name + "\\n")
-    if name in ("run_script", "run"):
-        path = os.environ["FAKE_UNITY_REPLIES"]
-        replies = json.load(open(path))
-        reply = replies.pop(0)
-        json.dump(replies, open(path, "w"))
-        if "log" in reply:
-            open(args[args.index("--log-file") + 1], "w").write(reply["log"])
-        if "error" in reply:
-            print(json.dumps({"success": False, "errors": [{"message": reply["error"]}]}))
-            raise SystemExit(1)
-        reply.setdefault("pipeline", os.environ["FAKE_UNITY_PIPELINE"])
-        print(json.dumps({"success": True, "data": {"result": {"success": True, "result": reply}}}))
-    elif name == "editor_stop":
-        print(json.dumps({"success": True, "data": {"result": "Exited play mode"}}))
-    else:
-        print(json.dumps({"success": False, "errors": [{"message": "no Editor"}]}))
-        raise SystemExit(1)
+    #!/bin/bash
+    { printf '%s\\n' "$@"; echo "ADB_LIBUSB=${ADB_LIBUSB-unset}"; } > "$FAKE_UNITY_ARGS"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -logFile) log=$2; shift ;;
+        -projectPath) project=$2; shift ;;
+        -unityVerifyRequest) request=$2; shift ;;
+      esac
+      shift
+    done
+    cp "$request" "$FAKE_UNITY_ARGS.request"
+    case "$FAKE_UNITY_MODE" in
+      abort)
+        printf 'Loading\\nAborting batchmode due to failure:\\nNo valid Unity Editor license found.\\n' > "$log"
+        exit 1 ;;
+      compile)
+        {
+          echo "-executeMethod"
+          echo "Assets/B.cs(7,1): error CS1002: ; expected"
+          echo "$project/Assets/D.cs(1,1): error CS0246: The type 'Gone' could not be found"
+          echo "Assets/A.cs(3,5): error CS0103: The name 'x' does not exist"
+          echo "Assets/B.cs(7,1): error CS1002: ; expected"
+          echo "Assets/C.cs(2,2): warning CS0168: The variable 'y' is declared but never used"
+          echo "Assembly with name 'Game' already exists (Assets/Game/Game.asmdef)"
+          echo "  LogAssemblyErrors (0ms)"
+          echo "Aborting batchmode due to failure:"
+          echo "Scripts have compiler errors."
+        } > "$log"
+        exit 1 ;;
+    esac
+    responses=$(dirname "$(dirname "$request")")/responses
+    id=$(basename "$request" .request)
+    cp "$FAKE_UNITY_REPLY" "$responses/$id.response"
+    rm -f "$request"
+    exit "$(head -n 1 "$FAKE_UNITY_REPLY")"
     """
 )
 
+# Stands in for an open Editor (its command line names the project like
+# Unity's does) that answers requests the way $FAKE_EDITOR_MODE says.
+FAKE_EDITOR = textwrap.dedent(
+    """\
+    #!/bin/bash
+    box=$2/Library/UnityVerify
+    mkdir -p "$box/requests" "$box/responses"
+    echo $$ > "$box/heartbeat"
+    while :; do
+      for request in "$box"/requests/*.request; do
+        [ -f "$request" ] || continue
+        id=$(basename "$request" .request)
+        cp "$request" "$FAKE_EDITOR_SEEN"
+        echo running > "$box/responses/$id.state"
+        [ "$FAKE_EDITOR_MODE" = exit ] && exit 0
+        cp "$FAKE_EDITOR_REPLY" "$box/responses/$id.response.tmp"
+        mv "$box/responses/$id.response.tmp" "$box/responses/$id.response"
+        rm -f "$request"
+      done
+      sleep 0.05
+    done
+    """
+)
 
-def make_project(root: Path, dependency: str | None = None) -> Path:
+FAILING_REPORT = "1\nFAIL tests; total=2 passed=1 failed=1 duration=0.50s mode=EditMode\n[1] BoardTests.Fails\n"
+
+
+def make_project(root: Path, dependency: str | None = None, version: str = "6000.3.10f1") -> Path:
     (root / "Assets").mkdir(parents=True)
     (root / "ProjectSettings").mkdir()
-    (root / "ProjectSettings" / "ProjectVersion.txt").write_text("m_EditorVersion: 6000.3.10f1\n")
+    (root / "ProjectSettings" / "ProjectVersion.txt").write_text(f"m_EditorVersion: {version}\n")
     (root / "Packages").mkdir()
     dependencies = {"com.unity.test-framework": "1.6.0"}
     if dependency:
@@ -83,7 +113,7 @@ def make_project(root: Path, dependency: str | None = None) -> Path:
     (root / "Packages" / "manifest.json").write_text(
         json.dumps({"dependencies": dependencies}, indent=2) + "\n"
     )
-    return root
+    return root.resolve()
 
 
 def make_stub_package(root: Path) -> Path:
@@ -112,24 +142,32 @@ class TempDirTestCase(unittest.TestCase):
         self.temp = Path(tempfile.mkdtemp(prefix="unity-verify-test-")).resolve()
         self.addCleanup(shutil.rmtree, self.temp, ignore_errors=True)
         self.environment = {**os.environ, "XDG_CACHE_HOME": str(self.temp / "cache")}
+        self.environment.pop("UNITY_EDITOR", None)
+
+    def write_script(self, name: str, text: str) -> Path:
+        path = self.temp / "bin" / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(text)
+        path.chmod(0o755)
+        return path
 
     def run_shim(self, shim: Path, *arguments: str, **environment: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(shim), *arguments],
+            [BASH, str(shim), *arguments],
             cwd=self.temp, env={**self.environment, **environment},
             capture_output=True, text=True, timeout=60,
         )
 
     def assert_ran(self, completed: subprocess.CompletedProcess[str], package: Path, project: Path) -> None:
         self.assertEqual(completed.returncode, 7, completed.stderr)
-        call = json.loads(completed.stdout)
-        self.assertEqual(Path(call["tool"]), package.resolve() / "Tools~" / "unity-verify")
-        self.assertEqual(call["argv"], ["--project-path", str(project), "Board"])
+        self.assertEqual(completed.stdout.splitlines(), [
+            str(package.resolve() / "Tools~" / "unity-verify"), "--project-path", str(project), "Board",
+        ])
 
 
 class ShimTests(TempDirTestCase):
     def test_runs_package_from_package_cache(self) -> None:
-        project = make_project(self.temp / "game", f"https://example.invalid/x.git#v1")
+        project = make_project(self.temp / "game", "https://example.invalid/x.git#v1")
         package = make_stub_package(project / "Library" / "PackageCache" / f"{PACKAGE}@4ee62b097584")
         self.assert_ran(self.run_shim(install_shim(project), "Board"), package, project)
 
@@ -159,10 +197,10 @@ class ShimTests(TempDirTestCase):
 
 
 class ToolTests(TempDirTestCase):
-    def run_tool(self, *arguments: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    def run_tool(self, *arguments: str, cwd: Path, **environment: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(TOOLS / "unity-verify"), *arguments],
-            cwd=cwd, env=self.environment, capture_output=True, text=True, timeout=60,
+            [BASH, str(TOOLS / "unity-verify"), *arguments],
+            cwd=cwd, env={**self.environment, **environment}, capture_output=True, text=True, timeout=60,
         )
 
     def test_reports_missing_project(self) -> None:
@@ -170,204 +208,153 @@ class ToolTests(TempDirTestCase):
         self.assertEqual(completed.returncode, 3)
         self.assertIn("ERR project_missing", completed.stderr)
 
-    def load_tool(self):
-        loader = SourceFileLoader("unity_verify", str(TOOLS / "unity-verify"))
-        tool = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
-        sys.modules[loader.name] = tool  # dataclasses look their module up here
-        self.addCleanup(sys.modules.pop, loader.name, None)
-        loader.exec_module(tool)
-        return tool
-
-    def test_finds_project_above_working_directory(self) -> None:
-        project = make_project(self.temp / "game")
-        tool = self.load_tool()
-        self.assertEqual(tool.find_project_root(project / "Assets"), project)
-        self.assertIsNone(tool.find_project_root(self.temp))
-
-    def test_requires_the_pipeline_version_the_package_depends_on(self) -> None:
-        self.assertEqual(self.load_tool().REQUIRED_PIPELINE_VERSION, PIPELINE)
-
     def test_rejects_unknown_arguments_with_tooling_exit(self) -> None:
         completed = self.run_tool("--nope", cwd=make_project(self.temp / "game"))
         self.assertEqual(completed.returncode, 3)
         self.assertIn("ERR args", completed.stderr)
 
-
-def test_result(name: str, status: str = "Passed", duration: float = 0.01) -> dict:
-    result = {"FullName": name, "Status": status, "Duration": duration, "Message": "", "StackTrace": ""}
-    if status == "Failed":
-        result["Message"] = "Expected: 1\n  But was:  2"
-        result["StackTrace"] = f"at {name} () [0x0] in /p/Assets/Tests/BoardTests.cs:12"
-    return result
-
-
-def tests_reply(*results: dict, frame_tests: int = 0) -> dict:
-    statuses = [result["Status"] for result in results]
-    return {
-        "state": "tests",
-        "Summary": {
-            "Total": len(results),
-            **{status: statuses.count(status) for status in ("Passed", "Failed", "Skipped", "Inconclusive")},
-        },
-        "Results": list(results),
-        "Duration": 0.5,
-        "Mode": "EditMode",
-        "FrameTests": frame_tests,
-        "FrameDuration": 4.0 if frame_tests else 0,
-    }
+    def test_hands_python_callers_over_to_bash(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, "-W", "error", str(TOOLS / "unity-verify"), "--help"],
+            env=self.environment, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(completed.stdout.startswith("usage: unity-verify"))
 
 
-class FakeUnityTestCase(TempDirTestCase):
-    def run_fake(self, *replies: dict, editor_open: bool) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-        bin_directory = self.temp / "bin"
-        bin_directory.mkdir()
-        (bin_directory / "unity").write_text(FAKE_UNITY)
-        (bin_directory / "unity").chmod(0o755)
-        (self.temp / "replies.json").write_text(json.dumps(list(replies)))
+class ColdPathTests(TempDirTestCase):
+    def run_cold(self, mode: str = "respond", reply: str = FAILING_REPORT, *arguments: str, cwd: Path | None = None):
+        unity = self.write_script("Unity", FAKE_UNITY)
+        (self.temp / "reply").write_text(reply)
         project = make_project(self.temp / "game")
-        (project / "Temp").mkdir()
-        with open(project / "Temp" / "UnityLockfile", "w") as lock:
-            if editor_open:
-                fcntl.flock(lock, fcntl.LOCK_EX)  # what an Editor with the project open holds
-            completed = subprocess.run(
-                [sys.executable, str(TOOLS / "unity-verify"), "--project-path", str(project)],
-                env={
-                    **self.environment,
-                    "PATH": f"{bin_directory}{os.pathsep}{os.environ['PATH']}",
-                    "FAKE_UNITY_REPLIES": str(self.temp / "replies.json"),
-                    "FAKE_UNITY_LOG": str(self.temp / "calls.log"),
-                    "FAKE_UNITY_PIPELINE": PIPELINE,
-                },
-                capture_output=True, text=True, timeout=60,
-            )
-        return completed, (self.temp / "calls.log").read_text().split()
-
-
-class WarmPathTests(FakeUnityTestCase):
-    def run_warm(self, *replies: dict) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-        return self.run_fake(*replies, editor_open=True)
-
-    def test_waits_through_compile_and_reload_then_reports_failures(self) -> None:
-        completed, calls = self.run_warm(
-            {"state": "busy"},
-            {"error": "Network error: connection reset"},
-            tests_reply(test_result("BoardTests.Passes"), test_result("BoardTests.Fails", "Failed")),
+        completed = subprocess.run(
+            [BASH, str(TOOLS / "unity-verify"), *arguments],
+            cwd=cwd or project / "Assets",
+            env={
+                **self.environment,
+                "UNITY_EDITOR": str(unity),
+                "FAKE_UNITY_MODE": mode,
+                "FAKE_UNITY_REPLY": str(self.temp / "reply"),
+                "FAKE_UNITY_ARGS": str(self.temp / "args"),
+            },
+            capture_output=True, text=True, timeout=60,
         )
-        self.assertEqual(completed.returncode, 1, completed.stdout)
-        self.assertEqual(calls, ["run_script"] * 3)
-        lines = completed.stdout.splitlines()
-        self.assertTrue(lines[0].startswith("FAIL tests; total=2 passed=1 failed=1 "), lines)
-        self.assertEqual(lines[1:], [
-            "[1] BoardTests.Fails", "  Expected: 1", "  But was:  2", "  at /p/Assets/Tests/BoardTests.cs:12",
+        return completed, project
+
+    def test_starts_a_batch_editor_that_answers_the_request(self) -> None:
+        completed, project = self.run_cold("respond", FAILING_REPORT, "Board")
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertEqual(completed.stdout, FAILING_REPORT.split("\n", 1)[1])
+        arguments = (self.temp / "args").read_text().splitlines()
+        self.assertEqual(arguments[:3], ["-batchmode", "-projectPath", str(project)])
+        self.assertEqual(arguments[arguments.index("-executeMethod") + 1], "UnityVerify.Batch.Run")
+        self.assertEqual(arguments[-1], "ADB_LIBUSB=0")
+        self.assertEqual((self.temp / "args.request").read_text(), "unity-verify 1\nBoard\n")
+        box = project / "Library" / "UnityVerify"
+        self.assertEqual(list((box / "requests").iterdir()) + list((box / "responses").iterdir()), [])
+
+    def test_reads_compile_errors_from_the_log_when_batch_mode_stops_on_them(self) -> None:
+        completed, _ = self.run_cold("compile")
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(completed.stdout.splitlines(), [
+            "ERR compile_failed; errors=4; tests=skipped",
+            "Assets/A.cs:3:5 error CS0103: The name 'x' does not exist",
+            "Assets/B.cs:7:1 error CS1002: ; expected",
+            "Assets/D.cs:1:1 error CS0246: The type 'Gone' could not be found",
+            "Assets/Game/Game.asmdef error: Assembly with name 'Game' already exists (Assets/Game/Game.asmdef)",
         ])
 
-    def test_stops_play_mode_once_and_notes_frame_tests(self) -> None:
-        completed, calls = self.run_warm(
-            {"state": "playing"},
-            {"state": "playing"},
-            tests_reply(test_result("BoardTests.A"), test_result("BoardTests.B"), frame_tests=1),
-        )
-        self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertEqual(calls, ["run_script", "editor_stop", "run_script", "run_script"])
-        self.assertTrue(completed.stdout.startswith("PASS tests; total=2 passed=2 failed=0 "))
-        self.assertIn("NOTE frame_tests; count=1; duration=4.00s;", completed.stdout)
-
-    def test_fails_passed_tests_over_one_second_and_warns_over_200ms(self) -> None:
-        completed, _ = self.run_warm(tests_reply(
-            test_result("BoardTests.Quick", duration=0.2),
-            test_result("BoardTests.Slow", duration=0.35),
-            test_result("BoardTests.Fails", "Failed", duration=1.2),
-            test_result("BoardTests.Slower", duration=1.0),
-            test_result("BoardTests.TooSlow", duration=1.5),
+    def test_reports_why_unity_stopped_before_the_request(self) -> None:
+        completed, _ = self.run_cold("abort")
+        self.assertEqual(completed.returncode, 3)
+        self.assertEqual(completed.stdout, (
+            "ERR unity_exited; code=1; cause=No valid Unity Editor license found.; "
+            "log=Library/UnityVerify/editor.log; fix=check the log\n"
         ))
-        self.assertEqual(completed.returncode, 1, completed.stdout)
-        lines = completed.stdout.splitlines()
-        self.assertTrue(lines[0].startswith("FAIL tests; total=5 passed=3 failed=2 too_slow=1 "), lines)
-        expectation = "tests fail over 1s and are expected to finish in under 50ms"
-        self.assertEqual(lines[1:], [
-            "[1] BoardTests.Fails", "  Expected: 1", "  But was:  2", "  at /p/Assets/Tests/BoardTests.cs:12",
-            "[2] BoardTests.TooSlow", f"  Took 1.5s; {expectation}.",
-            f"WARN slow_tests; count=2; over=200ms; hint={expectation}",
-            "  1s BoardTests.Slower", "  350ms BoardTests.Slow",
-        ])
 
-    def test_slow_tests_alone_still_pass(self) -> None:
-        completed, _ = self.run_warm(tests_reply(test_result("BoardTests.Slow", duration=0.25)))
-        self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertEqual(completed.stdout.splitlines()[1:], [
-            "WARN slow_tests; count=1; over=200ms; "
-            "hint=tests fail over 1s and are expected to finish in under 50ms",
-            "  250ms BoardTests.Slow",
-        ])
-
-    def test_reports_compile_errors(self) -> None:
-        completed, _ = self.run_warm({
-            "state": "compile_failed",
-            "diagnostics": [{"message": "Assets/A.cs(3,5): error CS1002: ; expected", "file": "", "line": 0, "column": 0}],
-        })
-        self.assertEqual(completed.returncode, 2)
-        self.assertEqual(completed.stdout.splitlines(), [
-            "ERR compile_failed; errors=1; tests=skipped", "Assets/A.cs:3:5 error CS1002: ; expected",
-        ])
-
-    def test_refuses_an_older_pipeline(self) -> None:
-        completed, calls = self.run_warm({"state": "busy", "pipeline": "0.5.0-exp.1"})
-        self.assertEqual(completed.returncode, 3)
-        self.assertEqual(calls, ["run_script"])
-        self.assertIn(f"ERR pipeline_version; got=0.5.0-exp.1; min={PIPELINE};", completed.stdout)
-
-    def test_reports_a_failing_first_call_without_retrying(self) -> None:
-        completed, calls = self.run_warm({"error": "run_script is disabled"})
-        self.assertEqual(completed.returncode, 3)
-        self.assertEqual(calls, ["run_script"])
-        self.assertIn("ERR unity_command; stage=warm; cause=run_script is disabled;", completed.stdout)
-
-    def test_falls_back_to_a_headless_editor_without_a_warm_one(self) -> None:
-        completed, calls = self.run_warm(
-            {"error": "No Pipeline instance found for project"}, tests_reply(test_result("BoardTests.A"))
+    def test_reports_a_missing_editor_version(self) -> None:
+        project = make_project(self.temp / "game", version="1.2.3f4")
+        completed = subprocess.run(
+            [BASH, str(TOOLS / "unity-verify"), "--project-path", str(project)],
+            env={**self.environment, "HOME": str(self.temp), "XDG_CONFIG_HOME": str(self.temp / "config")},
+            capture_output=True, text=True, timeout=60,
         )
-        self.assertEqual(calls, ["run_script", "run"])
-        self.assertEqual(completed.returncode, 0, completed.stdout)
-        self.assertTrue(completed.stdout.startswith("PASS tests; total=1 passed=1 failed=0 "))
-
-
-class ColdPathTests(FakeUnityTestCase):
-    def run_cold(self, *replies: dict) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-        return self.run_fake(*replies, editor_open=False)
-
-    def test_runs_one_headless_editor_when_no_editor_has_the_project_open(self) -> None:
-        completed, calls = self.run_cold(
-            tests_reply(test_result("BoardTests.Passes"), test_result("BoardTests.Fails", "Failed"))
-        )
-        self.assertEqual(calls, ["run"])
-        self.assertEqual(completed.returncode, 1, completed.stdout)
-        self.assertTrue(completed.stdout.startswith("FAIL tests; total=2 passed=1 failed=1 "))
-
-    def test_reports_compile_errors_from_the_editor_log(self) -> None:
-        error = "Assets/A.cs(3,5): error CS1002: ; expected"
-        completed, _ = self.run_cold({
-            "error": "Unity exited with code 1 before the Pipeline server became ready.",
-            "log": f"{error}\n##utp:{json.dumps({'type': 'Compiler', 'message': error})}\n"
-                   "Aborting batchmode due to failure:\nScripts have compiler errors.\n",
-        })
-        self.assertEqual(completed.returncode, 2, completed.stdout)
-        self.assertEqual(completed.stdout.splitlines(), [
-            "ERR compile_failed; errors=1; tests=skipped", "Assets/A.cs:3:5 error CS1002: ; expected",
-        ])
-
-    def test_reports_why_batch_mode_stopped(self) -> None:
-        completed, _ = self.run_cold({
-            "error": "Unity exited with code 1 before the Pipeline server became ready.",
-            "log": "Aborting batchmode due to failure:\nNo valid Unity Editor license found.\n",
-        })
         self.assertEqual(completed.returncode, 3)
-        self.assertIn("ERR unity_command; stage=cold; cause=No valid Unity Editor license found.;", completed.stdout)
+        self.assertIn("ERR editor_missing; version=1.2.3f4;", completed.stdout)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Unity Hub's macOS layout")
+    def test_finds_an_editor_added_to_unity_hub_from_disk(self) -> None:
+        app = self.temp / "Unity-1.2.3" / "Unity.app"
+        binary = app / "Contents" / "MacOS" / "Unity"
+        binary.parent.mkdir(parents=True)
+        binary.write_text(FAKE_UNITY)
+        binary.chmod(0o755)
+        hub = self.temp / "Library" / "Application Support" / "UnityHub"
+        hub.mkdir(parents=True)
+        (hub / "editors-v2.json").write_text(json.dumps({"schema_version": "2", "data": [
+            {"version": "1.0.0f1", "location": ["/nowhere/Unity.app"], "manual": True},
+            {"version": "1.2.3f4", "location": [str(app)], "manual": True, "buildPlatforms": [{"name": "iOS"}]},
+        ]}, separators=(",", ":")))
+        (self.temp / "reply").write_text("0\nPASS tests\n")
+        project = make_project(self.temp / "game", version="1.2.3f4")
+        completed = subprocess.run(
+            [BASH, str(TOOLS / "unity-verify"), "--project-path", str(project)],
+            env={
+                **self.environment, "HOME": str(self.temp), "FAKE_UNITY_MODE": "respond",
+                "FAKE_UNITY_REPLY": str(self.temp / "reply"), "FAKE_UNITY_ARGS": str(self.temp / "args"),
+            },
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual((completed.returncode, completed.stdout), (0, "PASS tests\n"), completed.stderr)
+
+
+class WarmPathTests(TempDirTestCase):
+    def run_warm(self, mode: str = "respond", reply: str = FAILING_REPORT):
+        editor = self.write_script("Unity", FAKE_EDITOR)
+        (self.temp / "reply").write_text(reply)
+        project = make_project(self.temp / "game")
+        environment = {
+            **self.environment,
+            "FAKE_EDITOR_MODE": mode,
+            "FAKE_EDITOR_REPLY": str(self.temp / "reply"),
+            "FAKE_EDITOR_SEEN": str(self.temp / "seen"),
+        }
+        # Detached, so it is reaped when it exits, as a real Editor is.
+        pid = int(subprocess.run(
+            [BASH, "-c", '"$0" "$@" > /dev/null 2>&1 & echo $!', str(editor), "-projectpath", str(project)],
+            env=environment, capture_output=True, text=True, check=True,
+        ).stdout)
+        self.addCleanup(lambda: subprocess.run(["kill", "-9", str(pid)], capture_output=True))
+        heartbeat = project / "Library" / "UnityVerify" / "heartbeat"
+        for _ in range(100):
+            if heartbeat.exists():
+                break
+            time.sleep(0.05)
+        completed = subprocess.run(
+            [BASH, str(TOOLS / "unity-verify"), "--project-path", str(project), "Board"],
+            # No batch-mode Unity: a cold run would fail on this.
+            env={**environment, "UNITY_EDITOR": "/nonexistent/Unity"},
+            capture_output=True, text=True, timeout=60,
+        )
+        return completed, project
+
+    def test_hands_the_request_to_the_open_editor(self) -> None:
+        completed, project = self.run_warm()
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertEqual(completed.stdout, FAILING_REPORT.split("\n", 1)[1])
+        self.assertEqual((self.temp / "seen").read_text(), "unity-verify 1\nBoard\n")
+        self.assertEqual(list((project / "Library" / "UnityVerify" / "responses").iterdir()), [])
+
+    def test_reports_an_editor_that_exits_during_the_run(self) -> None:
+        completed, _ = self.run_warm("exit")
+        self.assertEqual(completed.returncode, 3)
+        self.assertTrue(completed.stdout.startswith("ERR editor_exited; pid="), completed.stdout)
 
 
 class InstallerTests(TempDirTestCase):
     def run_install(self, project: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(TOOLS / "install"), "--project-path", str(project), *arguments],
+            [BASH, str(TOOLS / "install"), "--project-path", str(project), *arguments],
             env=self.environment, capture_output=True, text=True, timeout=60,
         )
 
@@ -400,6 +387,25 @@ class InstallerTests(TempDirTestCase):
                 added = [line for line in manifest.read_text().splitlines() if line.rstrip(",") not in before]
                 self.assertEqual(len(added), 1, added)
                 self.assertTrue(added[0].startswith(" " * indent * 2 + f'"{PACKAGE}": "https://'))
+                json.loads(manifest.read_text())
+
+    def test_updates_the_pin_in_place(self) -> None:
+        project = make_project(self.temp / "game")
+        manifest = project / "Packages" / "manifest.json"
+        manifest.write_text(json.dumps(
+            {"dependencies": {PACKAGE: "https://example.invalid/x.git#v1", "zz.last": "1"}}, indent=2
+        ) + "\n")
+        self.assertEqual(self.run_install(project, "--version", "v2").returncode, 0)
+        self.assertEqual(json.loads(manifest.read_text())["dependencies"], {
+            PACKAGE: "https://github.com/minis-studio/unity-verify.git#v2", "zz.last": "1",
+        })
+
+    def test_fills_empty_dependencies(self) -> None:
+        project = make_project(self.temp / "game")
+        manifest = project / "Packages" / "manifest.json"
+        manifest.write_text('{\n  "dependencies": {}\n}\n')
+        self.assertEqual(self.run_install(project, "--version", "v2").returncode, 0)
+        self.assertEqual(list(json.loads(manifest.read_text())["dependencies"]), [PACKAGE])
 
     def test_is_idempotent(self) -> None:
         project = make_project(self.temp / "game")
@@ -410,7 +416,7 @@ class InstallerTests(TempDirTestCase):
 
     def test_refuses_to_replace_a_real_script_without_force(self) -> None:
         project = make_project(self.temp / "game")
-        (project / "unity-verify").write_text("#!/usr/bin/env python3\n# not a shim\n")
+        (project / "unity-verify").write_text("#!/bin/bash\n# not a shim\n")
         completed = self.run_install(project)
         self.assertEqual(completed.returncode, 3)
         self.assertIn("ERR shim_exists", completed.stderr)

@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.5.0]
+
+- The package no longer depends on `com.unity.pipeline`, the Unity CLI or
+  Python. It depends on `com.unity.test-framework`, and `Tools~/unity-verify`,
+  the shim and the installer are bash scripts
+  (`curl … /Tools~/install | bash`).
+- The runner is a small Editor-only assembly, `UnityVerify.Editor`, which runs
+  the tests and also writes the report and exit code. The open Editor answers
+  requests left in `Library/UnityVerify/` on Editor updates, through compiles,
+  reloads and Play Mode, and keeps itself ticking while a request is in
+  progress. Concurrent runs each get their own request.
+- Without an open Editor, `unity-verify` starts the Unity binary itself, in
+  batch mode with `-executeMethod UnityVerify.Batch.Run`, found the way Unity
+  Hub installs it or from `UNITY_EDITOR`. Its log is kept in
+  `Library/UnityVerify/editor.log`. When scripts don't compile, batch mode stops
+  right away and the compiler and assembly definition errors are read from that
+  log. A run waits for another batch-mode Editor that has the project open.
+- Errors about the Unity CLI and Pipeline (`cli_*`, `pipeline_version`,
+  `unity_command`) are gone. New ones: `editor_missing`, `editor_unprepared`
+  (the open Editor hasn't loaded the package), `editor_unresponsive`,
+  `editor_exited`, `unity_exited`, `project_busy`, and `protocol` (a shim and
+  package that don't match). A run in the open Editor that takes too long
+  reports `timeout` with what the Editor was doing.
+- The tool still runs when started with `python3`: it hands over to bash.
+
 ## [0.4.0]
 
 - Breaking: a test that takes longer than 1 s fails, even when its assertions

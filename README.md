@@ -8,26 +8,25 @@ $ ./unity-verify
 PASS tests; total=212 passed=212 failed=0 duration=8.41s mode=EditMode
 ```
 
-It reuses the open Unity Editor through Unity Pipeline (`com.unity.pipeline`)
-when one is running (leaving Play Mode first), and otherwise compiles and tests
-in one headless Editor. Either way the tests run synchronously, so a run takes
-little more than the tests' own code (see [Fast tests](#fast-tests)).
-Output is compact and machine-readable, and exit codes are stable, so agents can
-act on them without reading Unity logs.
+It runs the tests in the Unity Editor that has the project open (leaving Play
+Mode first), and otherwise in a batch-mode Editor it starts for the run. Either
+way the tests run synchronously, so a run takes little more than the tests' own
+code (see [Fast tests](#fast-tests)). Output is compact and machine-readable,
+and exit codes are stable, so agents can act on them without reading Unity logs.
 
 ## Requirements
 
-- Unity 6 (`6000.0`+). The package pulls in `com.unity.pipeline`; a project
-  that pins it below the version in `package.json` gets `ERR pipeline_version`.
-- Unity CLI `>= 1.0.0-beta.12` on `PATH` as `unity`.
-- Python 3.9+, macOS or Linux.
+- Unity 6 (`6000.0`+). The package pulls in `com.unity.test-framework`.
+- For runs without an open Editor, the project's Editor version installed
+  through Unity Hub, or `UNITY_EDITOR` set to the Unity binary.
+- bash, on macOS or Linux.
 
 ## Install
 
 From the Unity project root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | python3 -
+curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash
 ```
 
 This pins the latest release in `Packages/manifest.json`, writes a small
@@ -41,7 +40,7 @@ This pins the latest release in `Packages/manifest.json`, writes a small
    `Packages/manifest.json`):
 
    ```json
-   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.4.0"
+   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.5.0"
    ```
 
 2. Copy [`Tools~/project-shim`](Tools~/project-shim) to `<project>/unity-verify`
@@ -79,8 +78,8 @@ changes) next to it in your own file.
 | `0` | Compiled, all tests passed | `PASS tests; total=212 passed=212 failed=0 ...` |
 | `1` | Failed or inconclusive tests, or tests over 1 s | `FAIL tests; total=212 passed=210 failed=2 ...` |
 | `2` | Compilation errors (tests skipped) | `ERR compile_failed; errors=1; tests=skipped` |
-| `3` | Tooling or environment problem | `ERR cli_version; got=1.0.0-beta.3; min=1.0.0-beta.12; fix=unity upgrade` |
-| `130` | Interrupted | `ERR interrupted; stage=unknown; fix=rerun` |
+| `3` | Tooling or environment problem | `ERR editor_missing; version=6000.3.10f1; fix=install it with Unity Hub, ...` |
+| `130` | Interrupted | `ERR interrupted; fix=rerun` |
 
 Failures and compiler errors follow the summary line, one per entry, with
 project-relative `path:line` locations.
@@ -109,14 +108,14 @@ Editor (see below) also include the time spent waiting for Editor updates.
 ## Fast tests
 
 In the open Editor, `unity-verify` refreshes assets, checks for compile errors
-and runs the tests in a single call. The tests run with the Test Framework's
-synchronous mode: the whole suite runs inside one Editor update, instead of
-taking several Editor updates per test, which a background Editor serves only a
-few times a second. The Editor doesn't respond to input until the run ends.
+and runs the tests in a single Editor update. The tests run with the Test
+Framework's synchronous mode: the whole suite runs at once, instead of taking
+several Editor updates per test, which a background Editor serves only a few
+times a second. The Editor doesn't respond to input until the run ends.
 
-Without an open Editor, one headless Editor opens the project, which compiles
+Without an open Editor, a batch-mode Editor opens the project, which compiles
 it, and runs the same tests the same way before it quits. If scripts don't
-compile, it stops before the tests and the compile errors are read from its log.
+compile, batch mode stops right away and the errors are read from its log.
 
 This changes what a test can rely on:
 
@@ -141,20 +140,29 @@ This changes what a test can rely on:
   report says so:
 
   ```text
-  NOTE frame_tests; count=1; duration=5.13s; hint=use [Test], not [UnityTest]/[UnitySetUp]/[UnityTearDown]
+  NOTE frame_tests; count=1; duration=4.27s; hint=use [Test], not [UnityTest]/[UnitySetUp]/[UnityTearDown]
   ```
 
-## How it is laid out
+## How it works
 
-The tool lives in the package, in `Tools~/` (Unity ignores `~` folders, so no
-`.meta` files or compilation). The version a project runs is whatever its
-manifest pins, and `packages-lock.json` records the exact commit. It runs
-`Tools~/UnityVerifyRunner.cs` through Unity Pipeline's `run_script` command, in
-the open Editor or in a headless one (`unity run --command run_script`).
-`run_script` compiles the file in memory, so it is never imported into the
-project.
+The package has two parts:
 
-The committed `./unity-verify` shim only finds that copy and runs it with
+- `Editor/` is a small Editor-only assembly (`UnityVerify.Editor`) that compiles
+  into the project. It runs the tests, applies the time limits and writes the
+  report. In the open Editor it answers requests that `unity-verify` leaves in
+  `Library/UnityVerify/`, on Editor updates: it leaves Play Mode first, waits
+  while the Editor compiles, imports or reloads, and keeps the Editor ticking
+  while a request is in progress. In a batch-mode Editor,
+  `UnityVerify.Batch.Run` answers one request and exits.
+- `Tools~/` holds bash scripts, which Unity ignores (`~` folders get no `.meta`
+  files or compilation). `unity-verify` hands a request to the Editor that has
+  the project open, or starts a batch-mode Editor of the project's version (as
+  Unity Hub installs it) and keeps its log in `Library/UnityVerify/editor.log`.
+  Either way it prints the report the Editor code wrote.
+
+The version a project runs is whatever its manifest pins, and
+`packages-lock.json` records the exact commit. The committed `./unity-verify`
+shim only finds that copy of the package and runs its `Tools~/unity-verify` with
 `--project-path` set to the project. It runs the copy Unity resolved into
 `Library/PackageCache/dev.minis.unity-verify@*/`. Until Unity has opened the
 checkout (right after install, a fresh clone or a new git worktree), it runs a
@@ -163,7 +171,7 @@ shallow clone of the pinned tag in `~/.cache/unity-verify/` instead.
 ## Updating
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | python3 - --version v0.4.0
+curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash -s -- --version v0.5.0
 ```
 
 or change the `#v…` suffix in `Packages/manifest.json`. The shim rarely changes;
@@ -175,9 +183,13 @@ the installer refreshes it either way.
 # Run your checkout's tool against a project:
 path/to/unity-verify/Tools~/unity-verify --project-path path/to/project
 
-# Tests (no Unity needed):
+# Script tests, with stand-ins for Unity (Python 3.9+):
 python3 -m unittest discover -s 'Tools~/tests'
 ```
+
+The Editor code's tests are in `Tests/Editor`. To run them, add the package to
+a project's `testables` in `Packages/manifest.json` and run `unity-verify`
+there.
 
 Releasing: update `version` in `package.json` and `CHANGELOG.md`, then tag
 `v<version>`. The installer pins the version in `package.json` on `main`, so
