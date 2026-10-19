@@ -45,13 +45,23 @@ public static class UnityVerifyRunner
     ///
     /// Returns a "state": "playing" or "busy" (compiling, importing or reloading)
     /// ask the caller to settle the Editor and call again; "compile_failed"
-    /// carries diagnostics; "tests" carries the results. Tests run with the
+    /// carries diagnostics; "tests" carries every test's result and duration,
+    /// which the caller checks against its time limits. Tests run with the
     /// Test Framework's runSynchronously, inside this one call, so they don't
     /// wait for Editor updates. Tests that need frames ([UnityTest],
     /// [UnitySetUp], [UnityTearDown]) are skipped by that mode and run
-    /// afterwards in a normal pass.
+    /// afterwards in a normal pass. Every reply also carries the version of
+    /// com.unity.pipeline running it, which the caller checks.
     /// </summary>
     public static async Task<object> Run(string filter)
+    {
+        var reply = await Verify(filter);
+        reply["pipeline"] = UnityEditor.PackageManager.PackageInfo
+            .FindForPackageName("com.unity.pipeline")?.version ?? "";
+        return reply;
+    }
+
+    static async Task<Dictionary<string, object>> Verify(string filter)
     {
         if (EditorApplication.isPlaying)
         {
@@ -145,10 +155,7 @@ public static class UnityVerifyRunner
                     ["Skipped"] = Count(results, TestStatus.Skipped),
                     ["Inconclusive"] = Count(results, TestStatus.Inconclusive),
                 },
-                ["Results"] = results
-                    .Where(result => result.TestStatus != TestStatus.Passed)
-                    .Select(Describe)
-                    .ToList(),
+                ["Results"] = results.Select(Describe).ToList(),
                 ["Duration"] = Math.Round(total.Elapsed.TotalSeconds, 2),
                 ["Mode"] = "EditMode",
                 ["FrameTests"] = frames.Results.Count,
@@ -201,6 +208,7 @@ public static class UnityVerifyRunner
         {
             ["FullName"] = result.Test.FullName,
             ["Status"] = result.TestStatus.ToString(),
+            ["Duration"] = Math.Round(result.Duration, 4),
             ["Message"] = result.Message,
             ["StackTrace"] = result.StackTrace,
         };

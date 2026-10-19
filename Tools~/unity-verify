@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import fcntl
 import json
 import os
 import re
@@ -14,7 +15,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +24,13 @@ from typing import Any
 PROJECT_ROOT = Path.cwd()
 RUNNER_PATH = Path(__file__).resolve().parent / "UnityVerifyRunner.cs"
 UNITY_EXECUTABLE = "unity"
-REQUIRED_UNITY_CLI_VERSION = "1.0.0-beta.8"
+REQUIRED_UNITY_CLI_VERSION = "1.0.0-beta.12"
+# The com.unity.pipeline version that runs UnityVerifyRunner.cs; package.json
+# depends on the same one.
+REQUIRED_PIPELINE_VERSION = "0.6.0-exp.1"
 UNITY_TIMEOUT_SECONDS = 330
+# A headless run imports and compiles the project before testing it.
+COLD_TIMEOUT_SECONDS = 2 * UNITY_TIMEOUT_SECONDS
 ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 CLI_VERSION = re.compile(r"\b(?:v)?(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\b")
 SEMVER = re.compile(
@@ -51,6 +56,12 @@ ASSEMBLY_ERROR = re.compile(
     re.IGNORECASE,
 )
 WARM_POLL_SECONDS = 0.5
+# Every test is expected to finish within TEST_EXPECTED_SECONDS. Run-to-run
+# variance is allowed up to 4x that before a warning; a test over
+# TEST_FAIL_SECONDS fails even when its assertions pass.
+TEST_EXPECTED_SECONDS = 0.05
+TEST_WARN_SECONDS = 0.2
+TEST_FAIL_SECONDS = 1.0
 
 EXIT_SUCCESS = 0
 EXIT_TEST_FAILURE = 1
@@ -75,13 +86,6 @@ class CompileDiagnostic:
     column: int = 0
     code: str = ""
     message: str = ""
-
-
-@dataclass(frozen=True)
-class CompileResult:
-    status: str
-    diagnostics: tuple[CompileDiagnostic, ...] = ()
-    detail: str = ""
 
 
 def parse_args() -> argparse.Namespace:
@@ -350,17 +354,13 @@ def stop_play_mode(executable: str, environment: dict[str, str]) -> str | None:
     return "\n".join(error_messages(envelope)) or "Unity editor_stop command failed"
 
 
-def run_runner(
-    executable: str, environment: dict[str, str], test_filter: str
-) -> dict[str, Any]:
-    """Run UnityVerifyRunner.cs in the open Editor and return the CLI envelope.
+def runner_arguments(test_filter: str) -> list[str]:
+    """Arguments of the run_script command that runs UnityVerifyRunner.cs.
 
     run_script compiles the file in memory, so nothing is imported into the
     project and no domain reload follows.
     """
-    command = warm_command(
-        executable,
-        "run_script",
+    return [
         "--file",
         str(RUNNER_PATH),
         "--entry",
@@ -369,6 +369,17 @@ def run_runner(
         json.dumps([test_filter]),
         "--timeout_ms",
         str(UNITY_TIMEOUT_SECONDS * 1000),
+    ]
+
+
+def run_runner(
+    executable: str, environment: dict[str, str], test_filter: str
+) -> dict[str, Any]:
+    """Run UnityVerifyRunner.cs in the open Editor and return the CLI envelope."""
+    command = warm_command(
+        executable,
+        "run_script",
+        *runner_arguments(test_filter),
         timeout=UNITY_TIMEOUT_SECONDS,
     )
     return cli_envelope(run_process(command, environment, UNITY_TIMEOUT_SECONDS + 10))
@@ -489,6 +500,9 @@ def parse_cold_compile_log(log: str) -> tuple[CompileDiagnostic, ...]:
     diagnostics: list[CompileDiagnostic] = []
     for raw_line in ANSI_ESCAPE.sub("", log).splitlines():
         line = raw_line.strip()
+        if line.startswith("##utp:"):
+            # Test-protocol JSON that repeats the plain log line.
+            continue
         diagnostic = diagnostic_from_values(line)
         if COMPILER_DIAGNOSTIC.match(line) and diagnostic:
             diagnostics.append(diagnostic)
@@ -522,11 +536,9 @@ def format_diagnostic(diagnostic: CompileDiagnostic) -> str:
     return " ".join(part for part in (location, f"{label}:", diagnostic.message) if part)
 
 
-def error_cause(detail: str, *, skip_summary: bool = False) -> str:
-    """Return one compact, field-safe cause, optionally after a summary line."""
+def error_cause(detail: str) -> str:
+    """Return one compact, field-safe cause."""
     lines = compact_message(detail)
-    if skip_summary:
-        lines = lines[1:]
     return (
         ANSI_ESCAPE.sub("", lines[0]).replace(";", ",")[:160]
         if lines
@@ -534,192 +546,28 @@ def error_cause(detail: str, *, skip_summary: bool = False) -> str:
     )
 
 
-def print_compile_result(result: CompileResult, stage: str) -> int:
-    if result.status == "failed":
-        print(f"ERR compile_failed; errors={len(result.diagnostics)}; tests=skipped")
-        for diagnostic in result.diagnostics:
-            print(format_diagnostic(diagnostic))
-        return EXIT_COMPILATION_FAILURE
-    if result.status == "error":
-        if "timed out" in result.detail.casefold():
-            timeout = UNITY_TIMEOUT_SECONDS + (10 if stage == "cold" else 0)
-            fix = "check Editor/log" if stage == "cold" else "check reload/Editor"
-            print(f"ERR compile_timeout; path={stage}; limit={timeout}s; fix={fix}")
-        elif "did not produce a log file" in result.detail:
-            print(
-                "ERR compile_log_missing; "
-                f"cause={error_cause(result.detail, skip_summary=True)}; "
-                "fix=check CLI stderr, Editor, temp access"
-            )
-        else:
-            print(
-                f"ERR compile_verify; stage={stage}; "
-                f"cause={error_cause(result.detail)}; tests=skipped"
-            )
+def print_compile_errors(diagnostics: tuple[CompileDiagnostic, ...], stage: str) -> int:
+    if not diagnostics:
+        print(
+            f"ERR compile_verify; stage={stage}; cause=Unity reports compilation "
+            "errors but returned no diagnostics; tests=skipped"
+        )
         return EXIT_ENVIRONMENT_FAILURE
-    return EXIT_SUCCESS
+    print(f"ERR compile_failed; errors={len(diagnostics)}; tests=skipped")
+    for diagnostic in diagnostics:
+        print(format_diagnostic(diagnostic))
+    return EXIT_COMPILATION_FAILURE
 
 
-def cold_compile_preflight(
-    executable: str,
-    environment: dict[str, str],
-    log_path: Path,
-) -> CompileResult:
-    command = [
-        executable,
-        "--no-banner",
-        "--no-pager",
-        "--non-interactive",
-        "--format",
-        "json",
-        "run",
-        str(PROJECT_ROOT),
-        "--timeout",
-        str(UNITY_TIMEOUT_SECONDS),
-        "--",
-        "-nographics",
-        "-logFile",
-        str(log_path),
-    ]
+def test_seconds(result: dict[str, Any]) -> float:
     try:
-        completed = run_process(command, environment, UNITY_TIMEOUT_SECONDS + 10)
-    except subprocess.TimeoutExpired:
-        return CompileResult("error", detail="Cold Unity compilation timed out after 340s")
-    except OSError as error:
-        return CompileResult("error", detail=f"Could not start cold Unity compilation: {error}")
-
-    if not log_path.is_file():
-        details: list[str] = []
-        try:
-            details.extend(error_messages(cli_envelope(completed)))
-        except (json.JSONDecodeError, ValueError):
-            details.extend(compact_message(completed.stderr or completed.stdout)[:5])
-        detail = "Cold Unity compilation did not produce a log file"
-        if details:
-            detail += "\n" + "\n".join(details)
-        return CompileResult("error", detail=detail)
-    try:
-        log = log_path.read_text(errors="replace")
-    except OSError as error:
-        return CompileResult("error", detail=f"Could not read cold Unity compilation log: {error}")
-    diagnostics = parse_cold_compile_log(log)
-    if diagnostics:
-        return CompileResult("failed", diagnostics)
-    if completed.returncode != 0:
-        details: list[str] = []
-        try:
-            details.extend(error_messages(cli_envelope(completed)))
-        except (json.JSONDecodeError, ValueError):
-            details.extend(compact_message(completed.stderr or completed.stdout)[:5])
-        if not details:
-            error_lines = [
-                line.strip()
-                for line in log.splitlines()
-                if re.search(r"\b(error|exception|failed|fatal)\b", line, re.IGNORECASE)
-            ]
-            details = error_lines[-5:]
-        return CompileResult(
-            "error",
-            detail="\n".join(details) or f"Cold Unity compilation exited with code {completed.returncode}",
-        )
-    return CompileResult("passed")
+        return float(result.get("Duration") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
-def parse_nunit_results(results_path: Path) -> dict[str, Any]:
-    root = ET.parse(results_path).getroot()
-    if root.tag != "test-run":
-        raise ValueError(f"unexpected NUnit root element: {root.tag}")
-
-    def count(name: str) -> int:
-        try:
-            return int(root.get(name, "0"))
-        except ValueError as error:
-            raise ValueError(f"invalid NUnit {name!r} count") from error
-
-    try:
-        duration = float(root.get("duration", "0"))
-    except ValueError as error:
-        raise ValueError("invalid NUnit duration") from error
-
-    mode = "EditMode"
-    for property_node in root.iter("property"):
-        if property_node.get("name") == "platform":
-            mode = property_node.get("value") or mode
-            break
-
-    results: list[dict[str, Any]] = []
-    for test_case in root.iter("test-case"):
-        failure = test_case.find("failure")
-        class_name = test_case.get("classname") or ""
-        method_name = test_case.get("methodname") or ""
-        status = (test_case.get("result") or "").split("(", 1)[0]
-        results.append(
-            {
-                "FullName": test_case.get("fullname") or test_case.get("name"),
-                "CanonicalName": f"{class_name}.{method_name}",
-                "Status": status,
-                "Message": failure.findtext("message") if failure is not None else "",
-                "StackTrace": (
-                    failure.findtext("stack-trace") if failure is not None else ""
-                ),
-            }
-        )
-
-    return {
-        "Summary": {
-            "Total": count("total"),
-            "Passed": count("passed"),
-            "Failed": count("failed"),
-            "Skipped": count("skipped"),
-            "Inconclusive": count("inconclusive"),
-        },
-        "Results": results,
-        "Duration": duration,
-        "Mode": mode,
-    }
-
-
-def canonical_test_name(result: dict[str, Any]) -> str:
-    canonical = result.get("CanonicalName")
-    if canonical:
-        return str(canonical)
-
-    full_name = str(result.get("FullName") or "")
-    name_without_arguments = full_name.split("(", 1)[0]
-    fixture_name, separator, leaf_name = name_without_arguments.rpartition(".")
-    if separator and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", leaf_name):
-        return f"{fixture_name}.{leaf_name}"
-    return fixture_name or name_without_arguments
-
-
-def filter_results_by_name(
-    result: dict[str, Any], requested_filter: str
-) -> dict[str, Any]:
-    if not requested_filter:
-        return result
-
-    results = result.get("Results") or []
-    folded_filter = requested_filter.casefold()
-    matched = [
-        item
-        for item in results
-        if folded_filter in canonical_test_name(item).casefold()
-    ]
-
-    counts = {
-        "Passed": 0,
-        "Failed": 0,
-        "Skipped": 0,
-        "Inconclusive": 0,
-    }
-    for item in matched:
-        status = item.get("Status")
-        if status in counts:
-            counts[status] += 1
-
-    result["Results"] = matched
-    result["Summary"] = {"Total": len(matched), **counts}
-    return result
+def format_seconds(seconds: float) -> str:
+    return f"{seconds:.3g}s" if seconds >= 1 else f"{seconds * 1000:.3g}ms"
 
 
 def print_report(result: dict[str, Any], requested_filter: str) -> int:
@@ -740,12 +588,29 @@ def print_report(result: dict[str, Any], requested_filter: str) -> int:
         )
         return EXIT_ENVIRONMENT_FAILURE
 
+    # Slowest first. Passed tests over the limit count as failures.
+    by_time = sorted(results, key=test_seconds, reverse=True)
+    too_slow = [
+        item
+        for item in by_time
+        if item.get("Status") == "Passed" and test_seconds(item) > TEST_FAIL_SECONDS
+    ]
+    slow = [
+        item
+        for item in by_time
+        if TEST_WARN_SECONDS < test_seconds(item) <= TEST_FAIL_SECONDS
+    ]
+    passed -= len(too_slow)
+    failed += len(too_slow)
+
     status = "PASS" if failed == 0 and inconclusive == 0 else "FAIL"
     fields = [
         f"total={total}",
         f"passed={passed}",
         f"failed={failed}",
     ]
+    if too_slow:
+        fields.append(f"too_slow={len(too_slow)}")
     if skipped:
         fields.append(f"skipped={skipped}")
     if inconclusive:
@@ -763,6 +628,24 @@ def print_report(result: dict[str, Any], requested_filter: str) -> int:
             print(f"  {line}")
         for location in compact_locations(failure.get("StackTrace")):
             print(f"  at {location}")
+    expectation = (
+        f"tests fail over {format_seconds(TEST_FAIL_SECONDS)} and are expected "
+        f"to finish in under {format_seconds(TEST_EXPECTED_SECONDS)}"
+    )
+    for index, item in enumerate(too_slow, start=len(failures) + 1):
+        print(f"[{index}] {item.get('FullName') or '<unnamed test>'}")
+        print(f"  Took {format_seconds(test_seconds(item))}; {expectation}.")
+
+    if slow:
+        print(
+            f"WARN slow_tests; count={len(slow)}; "
+            f"over={format_seconds(TEST_WARN_SECONDS)}; hint={expectation}"
+        )
+        for item in slow:
+            print(
+                f"  {format_seconds(test_seconds(item))} "
+                f"{item.get('FullName') or '<unnamed test>'}"
+            )
 
     frame_tests = int(result.get("FrameTests") or 0)
     if frame_tests:
@@ -773,6 +656,26 @@ def print_report(result: dict[str, Any], requested_filter: str) -> int:
         )
 
     return EXIT_SUCCESS if status == "PASS" else EXIT_TEST_FAILURE
+
+
+def report_runner_result(payload: dict[str, Any], test_filter: str, stage: str) -> int | None:
+    """Print the runner's tests or compile errors; None for any other state.
+
+    An older com.unity.pipeline is reported whatever the state.
+    """
+    pipeline = str(payload.get("pipeline") or "")
+    if not version_is_at_least(pipeline, REQUIRED_PIPELINE_VERSION):
+        print(
+            f"ERR pipeline_version; got={pipeline or 'unknown'}; "
+            f"min={REQUIRED_PIPELINE_VERSION}; "
+            "fix=let Unity resolve packages/update com.unity.pipeline"
+        )
+        return EXIT_ENVIRONMENT_FAILURE
+    if payload["state"] == "tests":
+        return print_report(payload, test_filter)
+    if payload["state"] == "compile_failed":
+        return print_compile_errors(diagnostics_from_items(payload.get("diagnostics")), stage)
+    return None
 
 
 def warm_verification(
@@ -816,20 +719,10 @@ def warm_verification(
             except ValueError as error:
                 print(f"ERR runner; cause={error_cause(str(error))}; fix=check CLI/Editor")
                 return EXIT_ENVIRONMENT_FAILURE
+            reported = report_runner_result(payload, test_filter, "warm")
+            if reported is not None:
+                return reported
             state = payload["state"]
-            if state == "tests":
-                return print_report(payload, test_filter)
-            if state == "compile_failed":
-                diagnostics = diagnostics_from_items(payload.get("diagnostics"))
-                return print_compile_result(
-                    CompileResult("failed", diagnostics)
-                    if diagnostics
-                    else CompileResult(
-                        "error",
-                        detail="Unity reports compilation errors but returned no diagnostics",
-                    ),
-                    "warm",
-                )
             if state == "playing" and not stop_sent:
                 failure = stop_play_mode(executable, environment)
                 if failure is not None:
@@ -874,47 +767,43 @@ def warm_verification(
 def cold_verification(
     executable: str, environment: dict[str, str], test_filter: str
 ) -> int:
-    """Compile and test through a spawned batch-mode Editor.
+    """Compile and test in one headless Editor through UnityVerifyRunner.cs.
 
-    Reached when no warm Editor answers. A batch-mode Editor starts in edit
-    mode, so no play-mode preflight applies on this path.
+    Reached when no warm Editor answers. `unity run --command run_script`
+    opens the project in batch mode, which imports and compiles it, and then
+    runs the same runner as the warm path. Batch mode stops before the runner
+    when scripts don't compile, so compile errors come from the Editor log.
     """
+    # The Android module starts an adb server while the Editor loads, which
+    # takes about 3s with adb's libusb backend on macOS and a fraction of that
+    # with the native one. Nothing here talks to devices.
+    environment = {"ADB_LIBUSB": "0", **environment}
     with tempfile.TemporaryDirectory(prefix="unity-verify-") as temporary_directory:
-        compile_log_path = Path(temporary_directory) / "compile.log"
-        compile_result = cold_compile_preflight(
-            executable, environment, compile_log_path
-        )
-        compile_exit = print_compile_result(compile_result, "cold")
-        if compile_exit:
-            return compile_exit
-
-        results_path = Path(temporary_directory) / "test-results.xml"
-        cold_command = [
+        log_path = Path(temporary_directory) / "editor.log"
+        command = [
             executable,
             "--no-banner",
             "--no-pager",
             "--non-interactive",
-            "test",
+            "--format",
+            "json",
+            "run",
             str(PROJECT_ROOT),
-            "--mode",
-            "EditMode",
-            "--output",
-            str(results_path),
             "--timeout",
-            str(UNITY_TIMEOUT_SECONDS),
+            str(COLD_TIMEOUT_SECONDS),
+            "--log-file",
+            str(log_path),
+            "--no-tail",
+            "--command",
+            "run_script",
+            "--",
+            *runner_arguments(test_filter),
         ]
-        if test_filter:
-            cold_command.extend(("--filter", f"(?i){re.escape(test_filter)}"))
-
         try:
-            completed = run_process(
-                cold_command,
-                environment,
-                UNITY_TIMEOUT_SECONDS + 10,
-            )
+            completed = run_process(command, environment, COLD_TIMEOUT_SECONDS + 10)
         except subprocess.TimeoutExpired:
             print(
-                f"ERR tests_timeout; path=cold; limit={UNITY_TIMEOUT_SECONDS + 10}s; "
+                f"ERR tests_timeout; path=cold; limit={COLD_TIMEOUT_SECONDS}s; "
                 "fix=check Editor/log"
             )
             return EXIT_ENVIRONMENT_FAILURE
@@ -925,24 +814,59 @@ def cold_verification(
             )
             return EXIT_ENVIRONMENT_FAILURE
 
-        if not results_path.is_file():
+        try:
+            envelope = cli_envelope(completed)
+        except (json.JSONDecodeError, ValueError):
+            envelope = {}
+        if envelope.get("success"):
+            try:
+                payload = runner_payload(envelope)
+            except ValueError as error:
+                print(f"ERR runner; cause={error_cause(str(error))}; fix=check CLI/Editor")
+                return EXIT_ENVIRONMENT_FAILURE
+            reported = report_runner_result(payload, test_filter, "cold")
+            if reported is not None:
+                return reported
             print(
-                "ERR test_results_missing; mode=EditMode; "
-                f"cause={error_cause(cli_error_detail(completed))}; "
-                "fix=check CLI stderr, Editor, temp access"
+                f"ERR runner; cause=headless Editor stayed {payload['state']}; "
+                "fix=check Editor/log"
             )
             return EXIT_ENVIRONMENT_FAILURE
 
         try:
-            cold_result = parse_nunit_results(results_path)
-        except (ET.ParseError, OSError, ValueError) as error:
-            print(
-                f"ERR test_results_invalid; cause={error_cause(str(error))}; "
-                "fix=check Editor/log/results"
-            )
-            return EXIT_ENVIRONMENT_FAILURE
+            log = log_path.read_text(errors="replace")
+        except OSError:
+            log = ""
+        diagnostics = parse_cold_compile_log(log)
+        if diagnostics:
+            return print_compile_errors(diagnostics, "cold")
+        # The CLI only says that Unity exited; batch mode logs why after this line.
+        aborted = log.partition("Aborting batchmode due to failure:")[2].strip()
+        detail = aborted or cli_error_detail(completed)
+        print(
+            f"ERR unity_command; stage=cold; cause={error_cause(detail)}; "
+            "fix=check CLI/Editor/log"
+        )
+        return EXIT_ENVIRONMENT_FAILURE
 
-        return print_report(filter_results_by_name(cold_result, test_filter), test_filter)
+
+def project_open_in_editor() -> bool:
+    """Whether an Editor holds the project's lock, so the warm path can answer."""
+    try:
+        descriptor = os.open(PROJECT_ROOT / "Temp" / "UnityLockfile", os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
 
 
 def main() -> int:
@@ -982,9 +906,10 @@ def main() -> int:
         )
         return EXIT_ENVIRONMENT_FAILURE
 
-    warm_exit = warm_verification(str(executable), environment, args.filter)
-    if warm_exit is not None:
-        return warm_exit
+    if project_open_in_editor():
+        warm_exit = warm_verification(str(executable), environment, args.filter)
+        if warm_exit is not None:
+            return warm_exit
     return cold_verification(str(executable), environment, args.filter)
 
 

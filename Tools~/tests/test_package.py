@@ -1,10 +1,11 @@
-"""Tests for the packaging layer and the tool's warm path, without Unity.
+"""Tests for the packaging layer and the tool's warm and cold paths, without Unity.
 
 Run from the package root: python3 -m unittest discover -s 'Tools~/tests'
 """
 
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import json
 import os
@@ -20,7 +21,9 @@ from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 TOOLS = PACKAGE_ROOT / "Tools~"
-PACKAGE = json.loads((PACKAGE_ROOT / "package.json").read_text())["name"]
+PACKAGE_JSON = json.loads((PACKAGE_ROOT / "package.json").read_text())
+PACKAGE = PACKAGE_JSON["name"]
+PIPELINE = PACKAGE_JSON["dependencies"]["com.unity.pipeline"]
 
 # Stands in for Tools~/unity-verify: reports how it was called.
 STUB_TOOL = textwrap.dedent(
@@ -32,8 +35,11 @@ STUB_TOOL = textwrap.dedent(
     """
 )
 
-# Stands in for the Unity CLI: answers run_script with the next reply in
+# Stands in for the Unity CLI: answers run_script, in the open Editor or in a
+# headless one (run --command run_script), with the next reply in
 # $FAKE_UNITY_REPLIES (a JSON list, consumed in order) and logs each command.
+# A reply's "log" is written to the headless Editor's --log-file, and a
+# reply without "pipeline" reports the version package.json depends on.
 FAKE_UNITY = textwrap.dedent(
     """\
     #!/usr/bin/env python3
@@ -45,14 +51,17 @@ FAKE_UNITY = textwrap.dedent(
     name = args[args.index("command") + 5] if "command" in args else args[5]
     with open(os.environ["FAKE_UNITY_LOG"], "a") as log:
         log.write(name + "\\n")
-    if name == "run_script":
+    if name in ("run_script", "run"):
         path = os.environ["FAKE_UNITY_REPLIES"]
         replies = json.load(open(path))
         reply = replies.pop(0)
         json.dump(replies, open(path, "w"))
+        if "log" in reply:
+            open(args[args.index("--log-file") + 1], "w").write(reply["log"])
         if "error" in reply:
             print(json.dumps({"success": False, "errors": [{"message": reply["error"]}]}))
             raise SystemExit(1)
+        reply.setdefault("pipeline", os.environ["FAKE_UNITY_PIPELINE"])
         print(json.dumps({"success": True, "data": {"result": {"success": True, "result": reply}}}))
     elif name == "editor_stop":
         print(json.dumps({"success": True, "data": {"result": "Exited play mode"}}))
@@ -161,15 +170,22 @@ class ToolTests(TempDirTestCase):
         self.assertEqual(completed.returncode, 3)
         self.assertIn("ERR project_missing", completed.stderr)
 
-    def test_finds_project_above_working_directory(self) -> None:
-        project = make_project(self.temp / "game")
+    def load_tool(self):
         loader = SourceFileLoader("unity_verify", str(TOOLS / "unity-verify"))
         tool = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
         sys.modules[loader.name] = tool  # dataclasses look their module up here
         self.addCleanup(sys.modules.pop, loader.name, None)
         loader.exec_module(tool)
+        return tool
+
+    def test_finds_project_above_working_directory(self) -> None:
+        project = make_project(self.temp / "game")
+        tool = self.load_tool()
         self.assertEqual(tool.find_project_root(project / "Assets"), project)
         self.assertIsNone(tool.find_project_root(self.temp))
+
+    def test_requires_the_pipeline_version_the_package_depends_on(self) -> None:
+        self.assertEqual(self.load_tool().REQUIRED_PIPELINE_VERSION, PIPELINE)
 
     def test_rejects_unknown_arguments_with_tooling_exit(self) -> None:
         completed = self.run_tool("--nope", cwd=make_project(self.temp / "game"))
@@ -177,18 +193,23 @@ class ToolTests(TempDirTestCase):
         self.assertIn("ERR args", completed.stderr)
 
 
-def tests_reply(failed: int = 0, frame_tests: int = 0) -> dict:
+def test_result(name: str, status: str = "Passed", duration: float = 0.01) -> dict:
+    result = {"FullName": name, "Status": status, "Duration": duration, "Message": "", "StackTrace": ""}
+    if status == "Failed":
+        result["Message"] = "Expected: 1\n  But was:  2"
+        result["StackTrace"] = f"at {name} () [0x0] in /p/Assets/Tests/BoardTests.cs:12"
+    return result
+
+
+def tests_reply(*results: dict, frame_tests: int = 0) -> dict:
+    statuses = [result["Status"] for result in results]
     return {
         "state": "tests",
-        "Summary": {"Total": 2, "Passed": 2 - failed, "Failed": failed, "Skipped": 0, "Inconclusive": 0},
-        "Results": [
-            {
-                "FullName": "BoardTests.Fails",
-                "Status": "Failed",
-                "Message": "Expected: 1\n  But was:  2",
-                "StackTrace": "at BoardTests.Fails () [0x0] in /p/Assets/Tests/BoardTests.cs:12",
-            }
-        ][:failed],
+        "Summary": {
+            "Total": len(results),
+            **{status: statuses.count(status) for status in ("Passed", "Failed", "Skipped", "Inconclusive")},
+        },
+        "Results": list(results),
         "Duration": 0.5,
         "Mode": "EditMode",
         "FrameTests": frame_tests,
@@ -196,28 +217,41 @@ def tests_reply(failed: int = 0, frame_tests: int = 0) -> dict:
     }
 
 
-class WarmPathTests(TempDirTestCase):
-    def run_warm(self, *replies: dict) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+class FakeUnityTestCase(TempDirTestCase):
+    def run_fake(self, *replies: dict, editor_open: bool) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         bin_directory = self.temp / "bin"
         bin_directory.mkdir()
         (bin_directory / "unity").write_text(FAKE_UNITY)
         (bin_directory / "unity").chmod(0o755)
         (self.temp / "replies.json").write_text(json.dumps(list(replies)))
-        completed = subprocess.run(
-            [sys.executable, str(TOOLS / "unity-verify"), "--project-path", str(make_project(self.temp / "game"))],
-            env={
-                **self.environment,
-                "PATH": f"{bin_directory}{os.pathsep}{os.environ['PATH']}",
-                "FAKE_UNITY_REPLIES": str(self.temp / "replies.json"),
-                "FAKE_UNITY_LOG": str(self.temp / "calls.log"),
-            },
-            capture_output=True, text=True, timeout=60,
-        )
+        project = make_project(self.temp / "game")
+        (project / "Temp").mkdir()
+        with open(project / "Temp" / "UnityLockfile", "w") as lock:
+            if editor_open:
+                fcntl.flock(lock, fcntl.LOCK_EX)  # what an Editor with the project open holds
+            completed = subprocess.run(
+                [sys.executable, str(TOOLS / "unity-verify"), "--project-path", str(project)],
+                env={
+                    **self.environment,
+                    "PATH": f"{bin_directory}{os.pathsep}{os.environ['PATH']}",
+                    "FAKE_UNITY_REPLIES": str(self.temp / "replies.json"),
+                    "FAKE_UNITY_LOG": str(self.temp / "calls.log"),
+                    "FAKE_UNITY_PIPELINE": PIPELINE,
+                },
+                capture_output=True, text=True, timeout=60,
+            )
         return completed, (self.temp / "calls.log").read_text().split()
+
+
+class WarmPathTests(FakeUnityTestCase):
+    def run_warm(self, *replies: dict) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        return self.run_fake(*replies, editor_open=True)
 
     def test_waits_through_compile_and_reload_then_reports_failures(self) -> None:
         completed, calls = self.run_warm(
-            {"state": "busy"}, {"error": "Network error: connection reset"}, tests_reply(failed=1)
+            {"state": "busy"},
+            {"error": "Network error: connection reset"},
+            tests_reply(test_result("BoardTests.Passes"), test_result("BoardTests.Fails", "Failed")),
         )
         self.assertEqual(completed.returncode, 1, completed.stdout)
         self.assertEqual(calls, ["run_script"] * 3)
@@ -229,12 +263,42 @@ class WarmPathTests(TempDirTestCase):
 
     def test_stops_play_mode_once_and_notes_frame_tests(self) -> None:
         completed, calls = self.run_warm(
-            {"state": "playing"}, {"state": "playing"}, tests_reply(frame_tests=1)
+            {"state": "playing"},
+            {"state": "playing"},
+            tests_reply(test_result("BoardTests.A"), test_result("BoardTests.B"), frame_tests=1),
         )
         self.assertEqual(completed.returncode, 0, completed.stdout)
         self.assertEqual(calls, ["run_script", "editor_stop", "run_script", "run_script"])
         self.assertTrue(completed.stdout.startswith("PASS tests; total=2 passed=2 failed=0 "))
         self.assertIn("NOTE frame_tests; count=1; duration=4.00s;", completed.stdout)
+
+    def test_fails_passed_tests_over_one_second_and_warns_over_200ms(self) -> None:
+        completed, _ = self.run_warm(tests_reply(
+            test_result("BoardTests.Quick", duration=0.2),
+            test_result("BoardTests.Slow", duration=0.35),
+            test_result("BoardTests.Fails", "Failed", duration=1.2),
+            test_result("BoardTests.Slower", duration=1.0),
+            test_result("BoardTests.TooSlow", duration=1.5),
+        ))
+        self.assertEqual(completed.returncode, 1, completed.stdout)
+        lines = completed.stdout.splitlines()
+        self.assertTrue(lines[0].startswith("FAIL tests; total=5 passed=3 failed=2 too_slow=1 "), lines)
+        expectation = "tests fail over 1s and are expected to finish in under 50ms"
+        self.assertEqual(lines[1:], [
+            "[1] BoardTests.Fails", "  Expected: 1", "  But was:  2", "  at /p/Assets/Tests/BoardTests.cs:12",
+            "[2] BoardTests.TooSlow", f"  Took 1.5s; {expectation}.",
+            f"WARN slow_tests; count=2; over=200ms; hint={expectation}",
+            "  1s BoardTests.Slower", "  350ms BoardTests.Slow",
+        ])
+
+    def test_slow_tests_alone_still_pass(self) -> None:
+        completed, _ = self.run_warm(tests_reply(test_result("BoardTests.Slow", duration=0.25)))
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        self.assertEqual(completed.stdout.splitlines()[1:], [
+            "WARN slow_tests; count=1; over=200ms; "
+            "hint=tests fail over 1s and are expected to finish in under 50ms",
+            "  250ms BoardTests.Slow",
+        ])
 
     def test_reports_compile_errors(self) -> None:
         completed, _ = self.run_warm({
@@ -246,6 +310,12 @@ class WarmPathTests(TempDirTestCase):
             "ERR compile_failed; errors=1; tests=skipped", "Assets/A.cs:3:5 error CS1002: ; expected",
         ])
 
+    def test_refuses_an_older_pipeline(self) -> None:
+        completed, calls = self.run_warm({"state": "busy", "pipeline": "0.5.0-exp.1"})
+        self.assertEqual(completed.returncode, 3)
+        self.assertEqual(calls, ["run_script"])
+        self.assertIn(f"ERR pipeline_version; got=0.5.0-exp.1; min={PIPELINE};", completed.stdout)
+
     def test_reports_a_failing_first_call_without_retrying(self) -> None:
         completed, calls = self.run_warm({"error": "run_script is disabled"})
         self.assertEqual(completed.returncode, 3)
@@ -253,10 +323,45 @@ class WarmPathTests(TempDirTestCase):
         self.assertIn("ERR unity_command; stage=warm; cause=run_script is disabled;", completed.stdout)
 
     def test_falls_back_to_a_headless_editor_without_a_warm_one(self) -> None:
-        completed, calls = self.run_warm({"error": "No Pipeline instance found for project"})
+        completed, calls = self.run_warm(
+            {"error": "No Pipeline instance found for project"}, tests_reply(test_result("BoardTests.A"))
+        )
         self.assertEqual(calls, ["run_script", "run"])
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        self.assertTrue(completed.stdout.startswith("PASS tests; total=1 passed=1 failed=0 "))
+
+
+class ColdPathTests(FakeUnityTestCase):
+    def run_cold(self, *replies: dict) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        return self.run_fake(*replies, editor_open=False)
+
+    def test_runs_one_headless_editor_when_no_editor_has_the_project_open(self) -> None:
+        completed, calls = self.run_cold(
+            tests_reply(test_result("BoardTests.Passes"), test_result("BoardTests.Fails", "Failed"))
+        )
+        self.assertEqual(calls, ["run"])
+        self.assertEqual(completed.returncode, 1, completed.stdout)
+        self.assertTrue(completed.stdout.startswith("FAIL tests; total=2 passed=1 failed=1 "))
+
+    def test_reports_compile_errors_from_the_editor_log(self) -> None:
+        error = "Assets/A.cs(3,5): error CS1002: ; expected"
+        completed, _ = self.run_cold({
+            "error": "Unity exited with code 1 before the Pipeline server became ready.",
+            "log": f"{error}\n##utp:{json.dumps({'type': 'Compiler', 'message': error})}\n"
+                   "Aborting batchmode due to failure:\nScripts have compiler errors.\n",
+        })
+        self.assertEqual(completed.returncode, 2, completed.stdout)
+        self.assertEqual(completed.stdout.splitlines(), [
+            "ERR compile_failed; errors=1; tests=skipped", "Assets/A.cs:3:5 error CS1002: ; expected",
+        ])
+
+    def test_reports_why_batch_mode_stopped(self) -> None:
+        completed, _ = self.run_cold({
+            "error": "Unity exited with code 1 before the Pipeline server became ready.",
+            "log": "Aborting batchmode due to failure:\nNo valid Unity Editor license found.\n",
+        })
         self.assertEqual(completed.returncode, 3)
-        self.assertIn("ERR compile_log_missing", completed.stdout)
+        self.assertIn("ERR unity_command; stage=cold; cause=No valid Unity Editor license found.;", completed.stdout)
 
 
 class InstallerTests(TempDirTestCase):

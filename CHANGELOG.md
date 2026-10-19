@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.4.0]
+
+- Breaking: a test that takes longer than 1 s fails, even when its assertions
+  pass. The summary line counts these in `failed` and adds `too_slow=N`, and
+  each one is listed with its time and the expectation that every test
+  finishes in under 50 ms.
+- Tests over 200 ms are listed, slowest first, after a `WARN slow_tests` line.
+- The runner returns every test's result with its duration, and the version of
+  `com.unity.pipeline` running it. Below the version `package.json` depends on,
+  the tool stops with `ERR pipeline_version`.
+- Without an open Editor, one headless Editor (`unity run --command
+  run_script`) opens the project and runs the same runner as the open Editor,
+  so tests run synchronously there too, with frame tests in a second pass. It
+  replaces the separate compile run and `unity test` run. Batch mode stops
+  before the runner when scripts don't compile, so compile errors come from
+  its log, and any other early exit reports Unity's own reason.
+- The headless Editor gets `ADB_LIBUSB=0` unless it is set: the Android
+  module's adb server then starts in a fraction of a second instead of about
+  3 s on macOS.
+- The open-Editor call is skipped when no Editor holds the project's
+  `Temp/UnityLockfile`.
+- A headless run times out after 660 s, for import, compilation and tests
+  together.
+- Requires Unity CLI `1.0.0-beta.12`, for `unity run --log-file` and
+  `--no-tail`.
+
 ## [0.3.0]
 
 - In the open Editor, one `run_script` call of `Tools~/UnityVerifyRunner.cs`
