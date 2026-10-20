@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1]
+
+- The package is MIT-licensed (`LICENSE.md`).
+- `package.json` names the author and license, and links the documentation,
+  changelog and license for the Package Manager window.
+- No changes to the tool or the Editor code.
+
 ## [0.7.0]
 
 - A test with NUnit's `[MaxTime]` gets that limit instead of the default ones:

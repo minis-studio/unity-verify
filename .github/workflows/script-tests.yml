@@ -1,0 +1,19 @@
+# Runs the Tools~ script tests, which use stand-ins for Unity. The Editor code's
+# tests (Tests/Editor) need a Unity Editor and run with unity-verify in a project.
+name: Script tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 -m unittest discover -s 'Tools~/tests' -v

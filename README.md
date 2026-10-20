@@ -1,25 +1,71 @@
-# Unity Verify
+# unity-verify
 
-One command that tells a coding agent (or a human) whether a Unity project still
-compiles and its EditMode tests still pass:
+[![Release](https://img.shields.io/github/v/release/minis-studio/unity-verify?sort=semver)](https://github.com/minis-studio/unity-verify/releases)
+[![Script tests](https://github.com/minis-studio/unity-verify/actions/workflows/script-tests.yml/badge.svg)](https://github.com/minis-studio/unity-verify/actions/workflows/script-tests.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE.md)
+[![Unity 6+](https://img.shields.io/badge/Unity-6000.0%2B-black?logo=unity)](#requirements)
+[![macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#requirements)
+
+One command that compiles a Unity project and runs its EditMode tests, whether
+or not the Editor has the project open. It reports the result in a form a coding
+agent can act on: a one-line verdict, stable exit codes, and failures with
+`path:line`.
 
 ```console
 $ ./unity-verify
 PASS tests; total=212 passed=212 failed=0 duration=8.41s mode=EditMode
+
+$ ./unity-verify
+ERR compile_failed; errors=1; tests=skipped
+Assets/Scripts/Board.cs:27:13 error CS0103: The name 'cell' does not exist in the current context
+
+$ ./unity-verify Board
+FAIL tests; total=18 passed=17 failed=1 duration=1.12s mode=EditMode
+[1] BoardTests.RejectsOverlap
+  Expected: False
+  But was:  True
+  at Assets/Tests/BoardTests.cs:41
 ```
 
-It runs the tests in the Unity Editor that has the project open (leaving Play
-Mode first), and otherwise in a batch-mode Editor it starts for the run. Either
-way the tests run synchronously, so a run takes little more than the tests' own
-code (see [Fast tests](#fast-tests)). Output is compact and machine-readable,
-and exit codes are stable, so agents can act on them without reading Unity logs.
+Coding agents such as Claude Code, Codex, Cursor and GitHub Copilot work best
+with a check they can run after every change. In Unity that check is awkward:
+Unity won't open a project in batch mode while an Editor has it open, a
+background Editor gives the Test Runner only a few updates a second, and
+results arrive as NUnit XML next to a long Editor log. `unity-verify` is that
+check as a single shell command, for agents and people alike, with no MCP
+server or client setup.
+
+## What it does
+
+- **Works with the Editor open or closed.** In the open Editor it leaves Play
+  Mode, resolves changed packages and waits out compiles and domain reloads,
+  then runs the tests there. Otherwise it starts a batch-mode Editor of the
+  project's version, found the way Unity Hub installs it, and quits it after
+  the run.
+- **Fast.** The Unity Test Framework's synchronous mode runs the whole suite in
+  one Editor update, so a run takes little more than the tests' own code. A
+  project with 979 EditMode tests runs them all in about 12 s in the open
+  Editor, a filtered subset in about 3 s, and everything in about 23 s when a
+  batch-mode Editor has to open the project first.
+- **Short output.** A passing run is one line. Failures and C# compiler errors
+  follow the summary, one entry each, with project-relative locations.
+  Environment errors carry a `fix=` hint.
+- **Stable exit codes** for passed, failed, didn't compile and couldn't run.
+- **Keeps the suite fast.** Tests over 200 ms get a warning and tests over 1 s
+  fail, unless a test sets its own NUnit `[MaxTime]`.
+- **Small and local.** A bash script and one Editor-only assembly. No server,
+  network port, Python or Node: requests are files in the project's
+  `Library/UnityVerify/`.
+- **Pinned per project.** `Packages/manifest.json` pins the version, so every
+  clone, git worktree and agent runs the same one. Concurrent runs each get
+  their own request.
 
 ## Requirements
 
 - Unity 6 (`6000.0`+). The package pulls in `com.unity.test-framework`.
+- bash, on macOS or Linux.
 - For runs without an open Editor, the project's Editor version installed
   through Unity Hub, or `UNITY_EDITOR` set to the Unity binary.
-- bash, on macOS or Linux.
 
 ## Install
 
@@ -29,9 +75,10 @@ From the Unity project root:
 curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash
 ```
 
-This pins the latest release in `Packages/manifest.json`, writes a small
-`./unity-verify` shim, and prints the agent snippet below. Commit
-`Packages/manifest.json`, `Packages/packages-lock.json` and `unity-verify`.
+The [installer](Tools~/install) is a short bash script. It pins the latest
+release in `Packages/manifest.json`, writes a small `./unity-verify` shim, and
+prints the agent snippet below. Commit `Packages/manifest.json`,
+`Packages/packages-lock.json` and `unity-verify`, then run `./unity-verify`.
 
 <details>
 <summary>Manual install</summary>
@@ -40,7 +87,7 @@ This pins the latest release in `Packages/manifest.json`, writes a small
    `Packages/manifest.json`):
 
    ```json
-   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.7.0"
+   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.7.1"
    ```
 
 2. Copy [`Tools~/project-shim`](Tools~/project-shim) to `<project>/unity-verify`
@@ -48,9 +95,10 @@ This pins the latest release in `Packages/manifest.json`, writes a small
 
 </details>
 
-## Agent integration
+## Agent setup
 
-Paste into `AGENTS.md` (or `CLAUDE.md`; a `CLAUDE.md` that only contains
+Any agent that can run a shell command can use `unity-verify`. Paste this into
+`AGENTS.md`, or `CLAUDE.md` for Claude Code (a `CLAUDE.md` that only contains
 `@AGENTS.md` picks it up too):
 
 <!-- agents-snippet:start -->
@@ -61,8 +109,9 @@ Verify every change by running `./unity-verify` with no arguments. It compiles t
 ```
 <!-- agents-snippet:end -->
 
-Keep project-specific rules (for example, a cheaper check for data-only
-changes) next to it in your own file.
+A project that also has a Unity MCP server can keep it; the snippet points
+agents at `./unity-verify` for verification. Keep project-specific rules (for
+example, a cheaper check for data-only changes) next to it in your own file.
 
 ## Usage
 
@@ -81,28 +130,20 @@ changes) next to it in your own file.
 | `3` | Tooling or environment problem | `ERR editor_missing; version=6000.3.10f1; fix=install it with Unity Hub, ...` |
 | `130` | Interrupted | `ERR interrupted; fix=rerun` |
 
-Failures and compiler errors follow the summary line, one per entry, with
-project-relative `path:line` locations.
-
 ## Test time limits
 
 Every test is expected to finish in under 50 ms. Timings vary between runs and
 machines, so a test only gets a warning above 200 ms (4× that), and it fails
-above 1 s even when its assertions pass:
+above 1 s even when its assertions pass. A test's time includes its `[SetUp]`
+and `[TearDown]`.
 
 ```text
-FAIL tests; total=212 passed=210 failed=2 too_slow=1 duration=9.02s mode=EditMode
-[1] BoardTests.RejectsOverlap
-  Expected: False
-  But was:  True
-  at Assets/Tests/BoardTests.cs:41
-[2] LevelTests.BuildsEveryLevel
+FAIL tests; total=212 passed=211 failed=1 too_slow=1 duration=9.02s mode=EditMode
+[1] LevelTests.BuildsEveryLevel
   Took 3.2s; tests fail over 1s and are expected to finish in under 50ms.
 WARN slow_tests; count=1; over=200ms; hint=tests fail over 1s and are expected to finish in under 50ms
   340ms SnapshotTests.SavesScene
 ```
-
-A test's time includes its `[SetUp]` and `[TearDown]`.
 
 A test can set its own limit with NUnit's `[MaxTime]`, in milliseconds. It then
 gets no warning and fails only over that limit, as it does in the Test Runner
@@ -120,19 +161,9 @@ public void BuildsEveryLevel() { ... }
 
 The agent snippet asks agents not to add or raise `[MaxTime]` unless asked.
 
-## Fast tests
+## Writing tests for synchronous runs
 
-In the open Editor, `unity-verify` refreshes assets, checks for compile errors
-and runs the tests in a single Editor update. The tests run with the Test
-Framework's synchronous mode: the whole suite runs at once, instead of taking
-several Editor updates per test, which a background Editor serves only a few
-times a second. The Editor doesn't respond to input until the run ends.
-
-Without an open Editor, a batch-mode Editor opens the project, which compiles
-it, and runs the same tests the same way before it quits. If scripts don't
-compile, batch mode stops right away and the errors are read from its log.
-
-This changes what a test can rely on:
+All tests run in one Editor update, so:
 
 - Nothing runs between tests. `EditorApplication.update` and `delayCall`
   callbacks that a test queues run after the whole pass, so clean up with
@@ -161,6 +192,13 @@ This changes what a test can rely on:
     MaterialTests.UpdatesOnTheNextFrame
   ```
 
+## Limitations
+
+- EditMode `[Test]`s only. PlayMode tests and tests that wait for frames don't
+  run.
+- macOS and Linux only.
+- The open Editor doesn't respond to input until a run ends.
+
 ## How it works
 
 The package has two parts:
@@ -173,7 +211,8 @@ The package has two parts:
   changed (a background Editor otherwise keeps its packages until it gets
   focus), waits while the Editor compiles, imports or reloads, and keeps the
   Editor ticking while a request is in progress. In a batch-mode Editor,
-  `UnityVerify.Batch.Run` answers one request and exits.
+  `UnityVerify.Batch.Run` answers one request and exits. If scripts don't
+  compile, batch mode stops right away and the errors are read from its log.
 - `Tools~/` holds bash scripts, which Unity ignores (`~` folders get no `.meta`
   files or compilation). `unity-verify` hands a request to the Editor that has
   the project open, or starts a batch-mode Editor of the project's version (as
@@ -191,11 +230,11 @@ shallow clone of the pinned tag in `~/.cache/unity-verify/` instead.
 ## Updating
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash -s -- --version v0.7.0
+curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash -s -- --version v0.7.1
 ```
 
 or change the `#v…` suffix in `Packages/manifest.json`. The shim rarely changes;
-the installer refreshes it either way.
+the installer refreshes it either way. See the [changelog](CHANGELOG.md).
 
 ## Developing
 
@@ -214,3 +253,8 @@ there.
 Releasing: update `version` in `package.json` and `CHANGELOG.md`, then tag
 `v<version>`. The installer pins the version in `package.json` on `main`, so
 push the tag before (or with) that commit.
+
+## License
+
+[MIT](LICENSE.md). Unity is a trademark of Unity Technologies. This project is
+not affiliated with or endorsed by Unity Technologies.
