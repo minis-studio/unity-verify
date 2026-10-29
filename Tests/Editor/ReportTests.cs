@@ -110,30 +110,45 @@ namespace UnityVerify
         }
 
         [Test]
-        public void FrameTestsAreNamedAsNotRun()
+        public void FrameAndPlayModeTestsFail()
         {
-            var outcome = Tests(Test("BoardTests.A"));
+            var outcome = Tests(Test("BoardTests.A"), Test("BoardTests.Fails", "Failed"));
             outcome.FrameTests.Add("BoardTests.WaitsAFrame");
+            outcome.PlayModeTests.Add("PlayTests.LoadsScene");
             var text = Report.Format(outcome, "", "warm", Root);
-            Assert.That(text.Code, Is.EqualTo(Report.Success));
+            Assert.That(text.Code, Is.EqualTo(Report.TestFailure));
             Assert.That(Lines(text), Is.EqualTo(new[]
             {
-                "PASS tests; total=1 passed=1 failed=0 frame_skipped=1 duration=0.50s mode=EditMode",
-                "WARN frame_tests_skipped; count=1; hint=[UnityTest], [UnitySetUp] and [UnityTearDown] tests " +
-                "don't run; write [Test]s that call Editor-update code directly",
-                "  BoardTests.WaitsAFrame",
+                "FAIL tests; total=4 passed=1 failed=3 frame_tests=1 playmode_tests=1 duration=0.50s mode=EditMode",
+                "[1] BoardTests.Fails",
+                "  Expected: 1",
+                "  But was:  2",
+                "  at Assets/Tests/BoardTests.cs:12",
+                "[2] BoardTests.WaitsAFrame",
+                "  Waits for frames ([UnityTest], [UnitySetUp] or [UnityTearDown]) and can't run; " +
+                "make it a [Test] that calls Editor-update code directly.",
+                "[3] PlayTests.LoadsScene",
+                "  PlayMode test, which can't run; make it a [Test] in an Editor-only test assembly.",
             }));
         }
 
         [Test]
-        public void FilterMatchingOnlyFrameTestsNamesThem()
+        public void FilterMatchingOnlyAPlayModeTestFails()
         {
             var outcome = Tests();
-            outcome.FrameTests.Add("BoardTests.WaitsAFrame");
-            var text = Report.Format(outcome, "Waits", "warm", Root);
-            Assert.That(text.Code, Is.EqualTo(Report.EnvironmentFailure));
-            Assert.That(Lines(text)[0], Is.EqualTo("ERR tests_none; filter=Waits; mode=EditMode; fix=check filter/tests"));
-            Assert.That(Lines(text)[2], Is.EqualTo("  BoardTests.WaitsAFrame"));
+            outcome.PlayModeTests.Add("PlayTests.LoadsScene");
+            var text = Report.Format(outcome, "Loads", "warm", Root);
+            Assert.That(text.Code, Is.EqualTo(Report.TestFailure));
+            Assert.That(Lines(text)[0], Is.EqualTo(
+                "FAIL tests; total=1 passed=0 failed=1 playmode_tests=1 duration=0.50s mode=EditMode filter=Loads"));
+        }
+
+        [Test]
+        public void SkippedTestsStillPass()
+        {
+            var text = Report.Format(Tests(Test("BoardTests.A"), Test("BoardTests.Ignored", "Skipped")), "", "warm", Root);
+            Assert.That(text.Code, Is.EqualTo(Report.Success));
+            Assert.That(text.Body, Is.EqualTo("PASS tests; total=2 passed=1 failed=0 skipped=1 duration=0.50s mode=EditMode"));
         }
 
         [Test]

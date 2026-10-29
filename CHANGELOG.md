@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.0]
+
+- PlayMode tests and tests that wait for frames (`[UnityTest]`, `[UnitySetUp]`,
+  `[UnityTearDown]`) fail instead of being skipped. The summary counts them in
+  `frame_tests=N` and `playmode_tests=N`, and each is listed like a failure
+  with how to rewrite it. `frame_skipped` and `WARN frame_tests_skipped` are
+  gone.
+- Ignored tests and tests for other platforms (`[UnityPlatform]`,
+  `[Platform]`) are still skipped, frame and PlayMode ones too, and count in
+  `skipped`.
+- The AGENTS.md snippet says these tests fail, and asks agents not to
+  `[Ignore]` a test to get past it unless asked.
+
 ## [0.7.1]
 
 - The package is MIT-licensed (`LICENSE.md`).

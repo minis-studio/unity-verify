@@ -176,20 +176,17 @@ namespace UnityVerify
         {
             var results = outcome.Results;
             int Count(string status) => results.Count(result => result.Status == status);
-            var total = results.Count;
+            var notRun = outcome.FrameTests.Count + outcome.PlayModeTests.Count;
+            var total = results.Count + notRun;
             var passed = Count("Passed");
-            var failed = Count("Failed");
+            var failed = Count("Failed") + notRun;
             var skipped = Count("Skipped");
             var inconclusive = Count("Inconclusive");
 
             if (total == 0)
             {
-                var none = Error($"tests_none; filter={(string.IsNullOrEmpty(filter) ? "none" : filter)}; " +
+                return Error($"tests_none; filter={(string.IsNullOrEmpty(filter) ? "none" : filter)}; " +
                     "mode=EditMode; fix=check filter/tests");
-                var notRun = new List<string> { none.Body };
-                AddFrameTests(outcome, notRun);
-                none.Body = string.Join("\n", notRun);
-                return none;
             }
 
             // Slowest first. Passed tests over their limit count as failures; a test
@@ -208,6 +205,14 @@ namespace UnityVerify
             {
                 fields.Add($"too_slow={tooSlow.Count}");
             }
+            if (outcome.FrameTests.Count > 0)
+            {
+                fields.Add($"frame_tests={outcome.FrameTests.Count}");
+            }
+            if (outcome.PlayModeTests.Count > 0)
+            {
+                fields.Add($"playmode_tests={outcome.PlayModeTests.Count}");
+            }
             if (skipped > 0)
             {
                 fields.Add($"skipped={skipped}");
@@ -215,10 +220,6 @@ namespace UnityVerify
             if (inconclusive > 0)
             {
                 fields.Add($"inconclusive={inconclusive}");
-            }
-            if (outcome.FrameTests.Count > 0)
-            {
-                fields.Add($"frame_skipped={outcome.FrameTests.Count}");
             }
             fields.Add("duration=" + outcome.Duration.ToString("0.00", CultureInfo.InvariantCulture) + "s");
             fields.Add("mode=EditMode");
@@ -245,6 +246,18 @@ namespace UnityVerify
                     : $"its [MaxTime] is {FormatSeconds(result.MaxTime.Value)}";
                 lines.Add($"  Took {FormatSeconds(result.Duration)}; {limit}.");
             }
+            // Only synchronous EditMode tests run, so tests that can't run fail.
+            foreach (var name in outcome.FrameTests)
+            {
+                lines.Add($"[{++index}] {name}");
+                lines.Add("  Waits for frames ([UnityTest], [UnitySetUp] or [UnityTearDown]) and can't run; " +
+                    "make it a [Test] that calls Editor-update code directly.");
+            }
+            foreach (var name in outcome.PlayModeTests)
+            {
+                lines.Add($"[{++index}] {name}");
+                lines.Add("  PlayMode test, which can't run; make it a [Test] in an Editor-only test assembly.");
+            }
 
             if (slow.Count > 0)
             {
@@ -252,22 +265,7 @@ namespace UnityVerify
                 lines.AddRange(slow.Select(result => $"  {FormatSeconds(result.Duration)} {Name(result)}"));
             }
 
-            AddFrameTests(outcome, lines);
             return new Text { Code = pass ? Success : TestFailure, Body = string.Join("\n", lines) };
-        }
-
-        // Tests that wait for frames don't run; name them, so what they cover counts
-        // as unverified.
-        static void AddFrameTests(Outcome outcome, List<string> lines)
-        {
-            if (outcome.FrameTests.Count == 0)
-            {
-                return;
-            }
-            lines.Add($"WARN frame_tests_skipped; count={outcome.FrameTests.Count}; " +
-                "hint=[UnityTest], [UnitySetUp] and [UnityTearDown] tests don't run; " +
-                "write [Test]s that call Editor-update code directly");
-            lines.AddRange(outcome.FrameTests.Select(name => "  " + name));
         }
 
         static string Name(TestResult result)

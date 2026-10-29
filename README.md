@@ -87,7 +87,7 @@ prints the agent snippet below. Commit `Packages/manifest.json`,
    `Packages/manifest.json`):
 
    ```json
-   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.7.1"
+   "dev.minis.unity-verify": "https://github.com/minis-studio/unity-verify.git#v0.8.0"
    ```
 
 2. Copy [`Tools~/project-shim`](Tools~/project-shim) to `<project>/unity-verify`
@@ -105,7 +105,7 @@ Any agent that can run a shell command can use `unity-verify`. Paste this into
 ```markdown
 ## Unity verification
 
-Verify every change by running `./unity-verify` with no arguments. It compiles the project and runs all EditMode tests, whether or not the Editor is open; don't check the Unity CLI/MCP first or run tests any other way. PlayMode tests and tests that wait for frames (`[UnityTest]`, `[UnitySetUp]`, `[UnityTearDown]`) don't run: write `[Test]`s that call Editor-update code directly, and list behavior only those could cover as unverified. Keep every test under 50 ms: tests over 200 ms get a warning and tests over 1 s fail, unless the test has its own `[MaxTime]`; don't add or raise one unless asked.
+Verify every change by running `./unity-verify` with no arguments. It compiles the project and runs all EditMode tests, whether or not the Editor is open; don't check the Unity CLI/MCP first or run tests any other way. PlayMode tests and tests that wait for frames (`[UnityTest]`, `[UnitySetUp]`, `[UnityTearDown]`) can't run, so they fail: write EditMode `[Test]`s that call Editor-update code directly, and don't `[Ignore]` a test to get past this unless asked. Keep every test under 50 ms: tests over 200 ms get a warning and tests over 1 s fail, unless the test has its own `[MaxTime]`; don't add or raise one unless asked.
 ```
 <!-- agents-snippet:end -->
 
@@ -125,7 +125,7 @@ example, a cheaper check for data-only changes) next to it in your own file.
 | Exit | Meaning | Example first line |
 |-----:|---------|--------------------|
 | `0` | Compiled, all tests passed | `PASS tests; total=212 passed=212 failed=0 ...` |
-| `1` | Failed or inconclusive tests, or tests over 1 s | `FAIL tests; total=212 passed=210 failed=2 ...` |
+| `1` | Failed or inconclusive tests, tests over 1 s, or PlayMode or frame tests | `FAIL tests; total=212 passed=210 failed=2 ...` |
 | `2` | Compilation errors (tests skipped) | `ERR compile_failed; errors=1; tests=skipped` |
 | `3` | Tooling or environment problem | `ERR editor_missing; version=6000.3.10f1; fix=install it with Unity Hub, ...` |
 | `130` | Interrupted | `ERR interrupted; fix=rerun` |
@@ -181,21 +181,25 @@ All tests run in one Editor update, so:
   ```
 
 - Tests that wait for frames (`[UnityTest]`, or a fixture with `[UnitySetUp]` or
-  `[UnityTearDown]`) don't run, like PlayMode tests: synchronous mode can't run
-  them, and a background Editor would spend seconds on even one. They don't
-  change the exit code; the summary counts them and the report names them, so
-  what they cover counts as unverified:
+  `[UnityTearDown]`) and PlayMode tests can't run: synchronous mode can't run
+  them, and a background Editor would spend seconds on even one. So they fail,
+  and the summary counts them in `frame_tests` and `playmode_tests`:
 
   ```text
-  PASS tests; total=211 passed=211 failed=0 frame_skipped=1 duration=8.02s mode=EditMode
-  WARN frame_tests_skipped; count=1; hint=[UnityTest], [UnitySetUp] and [UnityTearDown] tests don't run; write [Test]s that call Editor-update code directly
-    MaterialTests.UpdatesOnTheNextFrame
+  FAIL tests; total=212 passed=210 failed=2 frame_tests=1 playmode_tests=1 duration=8.02s mode=EditMode
+  [1] MaterialTests.UpdatesOnTheNextFrame
+    Waits for frames ([UnityTest], [UnitySetUp] or [UnityTearDown]) and can't run; make it a [Test] that calls Editor-update code directly.
+  [2] LevelPlayTests.LoadsTheLevel
+    PlayMode test, which can't run; make it a [Test] in an Editor-only test assembly.
   ```
+
+- Ignored tests (`[Ignore]`, `Assert.Ignore`) and tests for other platforms
+  (`[UnityPlatform]`, `[Platform]`) are skipped, whatever kind they are. The
+  summary counts them in `skipped`, and they don't change the exit code.
 
 ## Limitations
 
-- EditMode `[Test]`s only. PlayMode tests and tests that wait for frames don't
-  run.
+- EditMode `[Test]`s only. PlayMode tests and tests that wait for frames fail.
 - macOS and Linux only.
 - The open Editor doesn't respond to input until a run ends.
 
@@ -230,7 +234,7 @@ shallow clone of the pinned tag in `~/.cache/unity-verify/` instead.
 ## Updating
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash -s -- --version v0.7.1
+curl -fsSL https://raw.githubusercontent.com/minis-studio/unity-verify/main/Tools~/install | bash -s -- --version v0.8.0
 ```
 
 or change the `#v…` suffix in `Packages/manifest.json`. The shim rarely changes;

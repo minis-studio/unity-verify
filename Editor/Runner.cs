@@ -6,6 +6,7 @@ using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
 using UnityEditor;
+using UnityEditor.Compilation;
 using UnityEditor.TestTools.TestRunner.Api;
 using UnityEngine;
 
@@ -23,8 +24,9 @@ namespace UnityVerify
         public readonly List<Diagnostic> Diagnostics = new List<Diagnostic>();
         public readonly List<TestResult> Results = new List<TestResult>();
         public double Duration;
-        // Tests that wait for frames, which don't run.
+        // Tests that wait for frames, and PlayMode tests. Neither runs, so both fail.
         public readonly List<string> FrameTests = new List<string>();
+        public readonly List<string> PlayModeTests = new List<string>();
     }
 
     sealed class Diagnostic
@@ -76,8 +78,9 @@ namespace UnityVerify
         /// settle the Editor and run again. Tests run with the Test Framework's
         /// runSynchronously, inside this one call, so they don't wait for Editor
         /// updates. Tests that wait for frames ([UnityTest], [UnitySetUp],
-        /// [UnityTearDown]) can't run that way, so they don't run; the outcome
-        /// names them.
+        /// [UnityTearDown]) can't run that way, and PlayMode tests don't run
+        /// either; the outcome names both, unless they are ignored or don't run
+        /// on this platform, which makes them skipped.
         /// </summary>
         internal static async Task<Outcome> Run(string filter)
         {
@@ -111,15 +114,15 @@ namespace UnityVerify
             try
             {
                 // Listing waits for Editor updates, so a full run skips it unless
-                // there may be frame tests to name.
-                var names = new List<string>();
+                // there may be frame or PlayMode tests to name.
+                var tests = new Listing();
                 var listed = !string.IsNullOrEmpty(filter) || MayNeedFrames();
                 if (listed)
                 {
-                    var tree = new TaskCompletionSource<ITestAdaptor>();
-                    api.RetrieveTestList(TestMode.EditMode, root => tree.TrySetResult(root));
-                    CollectTests(await tree.Task, filter ?? "", names);
+                    tests = await List(api, TestMode.EditMode, filter);
                 }
+                var names = tests.Names;
+                var playMode = MayHavePlayModeTests() ? await List(api, TestMode.PlayMode, filter) : new Listing();
 
                 var sync = new Collector();
                 if (!listed || names.Count > 0)
@@ -142,13 +145,31 @@ namespace UnityVerify
 
                 var ran = new HashSet<string>(sync.Results.Select(result => result.Test.FullName));
                 var outcome = new Outcome { State = Outcome.Tests, Duration = total.Elapsed.TotalSeconds };
-                outcome.FrameTests.AddRange(names.Where(name => !ran.Contains(name)));
                 outcome.Results.AddRange(sync.Results.Select(Result));
+                AddNotRun(outcome, tests, ran, outcome.FrameTests);
+                AddNotRun(outcome, playMode, ran, outcome.PlayModeTests);
                 return outcome;
             }
             finally
             {
                 UnityEngine.Object.DestroyImmediate(api);
+            }
+        }
+
+        // Listed tests that didn't run: skipped when ignored or not for this
+        // platform, otherwise added to notRun.
+        static void AddNotRun(Outcome outcome, Listing listing, HashSet<string> ran, List<string> notRun)
+        {
+            foreach (var name in listing.Names.Where(name => !ran.Contains(name)))
+            {
+                if (listing.Skipped.Contains(name))
+                {
+                    outcome.Results.Add(new TestResult { FullName = name, Status = "Skipped" });
+                }
+                else
+                {
+                    notRun.Add(name);
+                }
             }
         }
 
@@ -208,11 +229,25 @@ namespace UnityVerify
             {
                 return true;
             }
-            var builders = TypeCache.GetTypesDerivedFrom<NUnit.Framework.Interfaces.ITestBuilder>()
+            return TestMethods().Any(method => method.ReturnType != typeof(void) && method.ReturnType != typeof(Task));
+        }
+
+        // Whether a test may be a PlayMode one: the Test Framework takes the tests
+        // in assemblies that aren't Editor-only as PlayMode tests. Errs towards true.
+        static bool MayHavePlayModeTests()
+        {
+            var editorOnly = new HashSet<string>(CompilationPipeline.GetAssemblies(AssembliesType.Editor)
+                .Where(assembly => (assembly.flags & AssemblyFlags.EditorAssembly) != 0)
+                .Select(assembly => assembly.name));
+            return TestMethods().Any(method => !editorOnly.Contains(method.DeclaringType.Assembly.GetName().Name));
+        }
+
+        static IEnumerable<MethodInfo> TestMethods()
+        {
+            return TypeCache.GetTypesDerivedFrom<NUnit.Framework.Interfaces.ITestBuilder>()
                 .Concat(TypeCache.GetTypesDerivedFrom<NUnit.Framework.Interfaces.ISimpleTestBuilder>())
-                .Where(IsAttribute);
-            return builders.Any(type => TypeCache.GetMethodsWithAttribute(type)
-                .Any(method => method.ReturnType != typeof(void) && method.ReturnType != typeof(Task)));
+                .Where(IsAttribute)
+                .SelectMany(type => TypeCache.GetMethodsWithAttribute(type));
         }
 
         static bool IsAttribute(Type type)
@@ -220,27 +255,48 @@ namespace UnityVerify
             return !type.IsAbstract && typeof(Attribute).IsAssignableFrom(type);
         }
 
+        sealed class Listing
+        {
+            public readonly List<string> Names = new List<string>();
+            // Ignored tests, and tests for other platforms ([UnityPlatform], [Platform]).
+            public readonly HashSet<string> Skipped = new HashSet<string>();
+        }
+
+        static async Task<Listing> List(TestRunnerApi api, TestMode mode, string filter)
+        {
+            var tree = new TaskCompletionSource<ITestAdaptor>();
+            api.RetrieveTestList(mode, root => tree.TrySetResult(root));
+            var listing = new Listing();
+            CollectTests(await tree.Task, filter ?? "", false, listing);
+            return listing;
+        }
+
         // Leaf tests whose fixture or method name contains the filter. Arguments
-        // are left out of the match.
-        static void CollectTests(ITestAdaptor test, string filter, List<string> names)
+        // are left out of the match. A skipped suite skips its tests.
+        static void CollectTests(ITestAdaptor test, string filter, bool skipped, Listing listing)
         {
             if (test == null || IsExplicit(test))
             {
                 return;
             }
+            skipped |= test.RunState == RunState.Ignored || test.RunState == RunState.Skipped;
             if (!test.IsSuite && !test.HasChildren)
             {
                 var name = test.FullName.Split('(')[0];
                 if (name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    names.Add(test.FullName);
+                    listing.Names.Add(test.FullName);
+                    if (skipped)
+                    {
+                        listing.Skipped.Add(test.FullName);
+                    }
                 }
             }
             if (test.Children != null)
             {
                 foreach (var child in test.Children)
                 {
-                    CollectTests(child, filter, names);
+                    CollectTests(child, filter, skipped, listing);
                 }
             }
         }
